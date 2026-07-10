@@ -1,0 +1,61 @@
+---
+# =============================================================================
+# Global cluster variables — x86_64 only. Non-secret settings live here;
+# credentials live in group_vars/all/vault.yml (ansible-vault encrypted).
+# Copy vault.yml.example -> vault.yml, fill in real passwords, then:
+#   ansible-vault encrypt group_vars/all/vault.yml
+# See README.md.
+# =============================================================================
+
+# ── Network ───────────────────────────────────────────────────────────────
+cluster_vip:   10.223.16.79
+vip_interface: enp1s0          # confirm with: ip -4 addr show
+vip_prefix:    24
+app_network:   10.223.16.0/24
+ops_network:   10.223.16.0/24
+ntp_server:    pool.ntp.org
+
+# VRRP: true = unicast (cloud/VMware safe default), false = multicast
+keepalived_unicast: true
+vrrp_router_id:     51
+# vrrp_auth_pass lives in group_vars/all/vault.yml
+
+# ── Cluster identity ─────────────────────────────────────────────────────
+patroni_scope:     pg-ha-cluster
+etcd_cluster_name: pg-ha-etcd
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────
+pg_version: 18                              # override with -e pg_version=16
+pg_port:    5432
+pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
+pg_log_dir:  /var/log/postgresql
+
+# Auto-sized at role runtime from ansible_memtotal_mb; override to pin.
+# shared_buffers_override: 8GB
+# effective_cache_size_override: 24GB
+work_mem: 16MB
+maintenance_work_mem: 256MB
+
+random_page_cost: "1.1"                     # NVMe/SSD default
+effective_io_concurrency: 200
+
+# ── Credentials ───────────────────────────────────────────────────────────
+# All password values (repl_password, patroni_super_pass, patroni_rewind_pass,
+# health_pass, app_db_pass, pcp_pass, haproxy_stats_pass) and their matching
+# usernames live in group_vars/all/vault.yml — see vault.yml.example.
+
+# ── Ports ─────────────────────────────────────────────────────────────────
+patroni_api_port:    8008
+etcd_client_port:    2379
+etcd_peer_port:      2380
+pgbouncer_port:      5433
+haproxy_write_port:  5000
+haproxy_read_port:   5001
+haproxy_stats_port:  7000
+
+# ── PgBouncer tuning ──────────────────────────────────────────────────────
+pgbouncer_pool_mode: transaction
+pgbouncer_max_client_conn: 1000
+pgbouncer_default_pool_size: 20
+pgbouncer_min_pool_size: 5
+pgbouncer_reserve_pool_size: 5

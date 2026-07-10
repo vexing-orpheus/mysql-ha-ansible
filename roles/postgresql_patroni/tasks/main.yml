@@ -1,0 +1,175 @@
+---
+# =============================================================================
+# postgresql_patroni — installs PostgreSQL + Patroni and forms the HA cluster.
+#
+# Patroni handles primary-election itself via etcd: whichever node's Patroni
+# starts first initializes the cluster, and the others detect the existing
+# leader key and clone as replicas automatically. To make that deterministic
+# rather than a race, invoke this role's play with `serial: 1` in site.yml so
+# pg-node-1 always starts (and becomes primary) before pg-node-2/3 start.
+# =============================================================================
+
+- name: Install PostgreSQL {{ pg_version }} packages
+  ansible.builtin.apt:
+    name:
+      - "postgresql-{{ pg_version }}"
+      - "postgresql-client-{{ pg_version }}"
+      - "postgresql-contrib-{{ pg_version }}"
+      - libpq-dev
+      - gcc
+    state: present
+
+- name: Stop and disable the distro-default postgresql wrapper service
+  ansible.builtin.systemd:
+    name: "postgresql@{{ pg_version }}-main"
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Drop the default pg_createcluster instance (Patroni manages its own data dir)
+  ansible.builtin.command: pg_dropcluster --stop {{ pg_version }} main
+  register: dropcluster
+  failed_when: false
+  changed_when: dropcluster.rc == 0
+
+- name: Check for a working apt python3-patroni >= {{ patroni_min_version }}
+  ansible.builtin.command: apt-cache policy python3-patroni
+  register: patroni_apt_policy
+  changed_when: false
+  failed_when: false
+
+- name: Install Patroni via apt when a suitable version is available
+  ansible.builtin.apt:
+    name: python3-patroni
+    state: present
+  register: patroni_apt_install
+  when: "'Candidate: (none)' not in patroni_apt_policy.stdout"
+
+- name: Install Patroni via pip when apt package is unavailable
+  ansible.builtin.pip:
+    name:
+      - "patroni[etcd3]>=3.0"
+      - psycopg2-binary
+      - python-etcd
+    extra_args: --break-system-packages
+  when: "'Candidate: (none)' in patroni_apt_policy.stdout"
+
+- name: Locate the patroni binary
+  ansible.builtin.command: which patroni
+  register: patroni_which
+  changed_when: false
+
+- name: Set patroni_bin fact
+  ansible.builtin.set_fact:
+    patroni_bin: "{{ patroni_which.stdout }}"
+
+- name: Read total memory and compute PostgreSQL memory tuning
+  ansible.builtin.set_fact:
+    pg_shared_buffers_gb: "{{ [[(ansible_memtotal_mb // 1024 // 4), 1] | max, 32] | min }}"
+    pg_effective_cache_gb: "{{ [((ansible_memtotal_mb // 1024) * 3 // 4), 1] | max }}"
+
+- name: Set final tuning facts (allow explicit overrides)
+  ansible.builtin.set_fact:
+    shared_buffers: "{{ shared_buffers_override | default(pg_shared_buffers_gb ~ 'GB') }}"
+    effective_cache_size: "{{ effective_cache_size_override | default(pg_effective_cache_gb ~ 'GB') }}"
+
+- name: Compute required huge pages count
+  ansible.builtin.set_fact:
+    hugepages_count: >-
+      {{ ((pg_shared_buffers_gb | int) * 1024 * 1024 * 1024 // huge_page_size_bytes) + huge_pages_spare }}
+
+- name: Apply huge pages sysctl value
+  ansible.posix.sysctl:
+    name: vm.nr_hugepages
+    value: "{{ hugepages_count | string }}"
+    sysctl_file: /etc/sysctl.d/90-pg-ha-cluster.conf
+    reload: true
+
+- name: Create directories for PostgreSQL data/logs and Patroni config
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  loop:
+    - "{{ pg_data_dir | dirname }}"
+    - "{{ pg_log_dir }}"
+
+- name: Create /etc/patroni
+  ansible.builtin.file:
+    path: /etc/patroni
+    state: directory
+    owner: root
+    group: postgres
+    mode: "0750"
+
+- name: Write patroni.yml
+  ansible.builtin.template:
+    src: patroni.yml.j2
+    dest: /etc/patroni/patroni.yml
+    owner: root
+    group: postgres
+    mode: "0640"
+  notify: reload patroni config
+
+- name: Install patroni systemd unit
+  ansible.builtin.template:
+    src: patroni.service.j2
+    dest: /etc/systemd/system/patroni.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd for patroni
+
+- name: Flush handlers so config/unit are current before we start Patroni
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start Patroni on {{ inventory_hostname }}
+  ansible.builtin.systemd:
+    name: patroni
+    enabled: true
+    state: started
+
+- name: Wait for Patroni to report a stable role (master/replica)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ patroni_api_port }}/patroni"
+    return_content: true
+    status_code: 200
+  register: patroni_status
+  until: >
+    patroni_status.json is defined and
+    patroni_status.json.role in ['master', 'primary', 'replica', 'standby']
+  retries: "{{ patroni_role_wait_retries }}"
+  delay: "{{ patroni_role_wait_delay }}"
+
+- name: Report this node's Patroni role
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} is Patroni role: {{ patroni_status.json.role }}"
+
+- name: Grant pg_rewind permissions and create the health-check role (leader only)
+  when: patroni_status.json.role in ['master', 'primary']
+  block:
+    - name: Grant pg_rewind support functions to the rewind user
+      community.postgresql.postgresql_query:
+        login_user: "{{ patroni_super_user }}"
+        login_password: "{{ patroni_super_pass }}"
+        login_host: 127.0.0.1
+        login_port: "{{ pg_port }}"
+        db: postgres
+        query: >
+          GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_dir(text, boolean, boolean)
+          TO {{ patroni_rewind_user }};
+      failed_when: false
+
+    - name: Create the health-check login role if missing
+      community.postgresql.postgresql_user:
+        login_user: "{{ patroni_super_user }}"
+        login_password: "{{ patroni_super_pass }}"
+        login_host: 127.0.0.1
+        login_port: "{{ pg_port }}"
+        name: "{{ health_user }}"
+        password: "{{ health_pass }}"
+        role_attr_flags: LOGIN
+        state: present
+      failed_when: false

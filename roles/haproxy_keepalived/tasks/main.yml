@@ -1,0 +1,110 @@
+---
+# =============================================================================
+# haproxy_keepalived — read/write routing (HAProxy) and VIP failover
+# (Keepalived) on both proxy nodes.
+# =============================================================================
+
+- name: Install HAProxy and Keepalived
+  ansible.builtin.apt:
+    name:
+      - haproxy
+      - keepalived
+      - socat
+      - curl
+      - ipset
+      - ipvsadm
+    state: present
+
+- name: Verify the VIP interface exists on this host
+  ansible.builtin.command: ip link show {{ vip_interface }}
+  register: vip_iface_check
+  changed_when: false
+  failed_when: vip_iface_check.rc != 0
+
+- name: Determine this node's VRRP role/priority from its position in proxy_nodes
+  ansible.builtin.set_fact:
+    vrrp_is_master: "{{ groups['proxy_nodes'].index(inventory_hostname) == 0 }}"
+
+- name: Set VRRP role and priority facts
+  ansible.builtin.set_fact:
+    vrrp_role: "{{ 'MASTER' if vrrp_is_master else 'BACKUP' }}"
+    vrrp_priority: "{{ 101 if vrrp_is_master else 100 }}"
+
+- name: Stop services before reconfiguring
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop: [haproxy, keepalived]
+  failed_when: false
+
+- name: Write haproxy.cfg
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart haproxy
+
+- name: Validate haproxy.cfg
+  ansible.builtin.command: haproxy -c -f /etc/haproxy/haproxy.cfg
+  changed_when: false
+
+- name: Create keepalived scripts directory
+  ansible.builtin.file:
+    path: "{{ haproxy_keepalived_scripts_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write keepalived health-check script
+  ansible.builtin.template:
+    src: check_services.sh.j2
+    dest: "{{ haproxy_keepalived_scripts_dir }}/check_services.sh"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write keepalived notify script
+  ansible.builtin.template:
+    src: notify.sh.j2
+    dest: "{{ haproxy_keepalived_scripts_dir }}/notify.sh"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write keepalived.conf
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart keepalived
+
+- name: Flush handlers so config is current before we start services
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    enabled: true
+    state: started
+
+- name: Enable and start Keepalived
+  ansible.builtin.systemd:
+    name: keepalived
+    enabled: true
+    state: started
+
+- name: Wait for HAProxy stats page to respond
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ haproxy_stats_port }}/stats"
+    url_username: "{{ haproxy_stats_user }}"
+    url_password: "{{ haproxy_stats_pass }}"
+    status_code: 200
+  register: haproxy_stats_check
+  until: haproxy_stats_check.status == 200
+  retries: 15
+  delay: 2

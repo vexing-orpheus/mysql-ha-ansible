@@ -1,0 +1,12 @@
+---
+- name: reload systemd for etcd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart etcd
+  ansible.builtin.systemd:
+    name: etcd
+    state: restarted
+  when: false   # config changes should be applied via a controlled rolling
+                # restart (playbooks/rolling_restart.yml), not automatically,
+                # to avoid an accidental simultaneous restart of all 3 members.

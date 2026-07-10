@@ -1,0 +1,114 @@
+---
+# =============================================================================
+# pgbouncer — connection pooler on both proxy nodes, active/active with
+# peer synchronisation when the installed version supports it (>= 1.21).
+# =============================================================================
+
+- name: Install PgBouncer
+  ansible.builtin.apt:
+    name:
+      - pgbouncer
+      - postgresql-client
+    state: present
+
+- name: Stop pgbouncer before reconfiguring
+  ansible.builtin.systemd:
+    name: pgbouncer
+    state: stopped
+  failed_when: false
+
+- name: Detect installed PgBouncer version
+  ansible.builtin.command: pgbouncer --version
+  register: pgbouncer_version_raw
+  changed_when: false
+
+- name: Parse PgBouncer version and decide on peer sync
+  ansible.builtin.set_fact:
+    pgbouncer_version: "{{ pgbouncer_version_raw.stdout | regex_search('[0-9]+\\.[0-9]+\\.[0-9]+') }}"
+
+- name: Enable peer sync if version >= {{ pgbouncer_min_peer_version }}
+  ansible.builtin.set_fact:
+    enable_peer_sync: "{{ pgbouncer_version is version(pgbouncer_min_peer_version, '>=') }}"
+
+- name: Compute this node's peer_id (1-based position in proxy_nodes)
+  ansible.builtin.set_fact:
+    pgbouncer_peer_id: "{{ groups['proxy_nodes'].index(inventory_hostname) + 1 }}"
+
+- name: Create PgBouncer directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ 'postgres' if item != pgbouncer_conf_dir else 'root' }}"
+    group: postgres
+    mode: "0750"
+  loop:
+    - "{{ pgbouncer_conf_dir }}"
+    - "{{ pgbouncer_log_dir }}"
+    - "{{ pgbouncer_run_dir }}"
+
+- name: Write userlist.txt (md5 auth)
+  ansible.builtin.template:
+    src: userlist.txt.j2
+    dest: "{{ pgbouncer_conf_dir }}/userlist.txt"
+    owner: root
+    group: postgres
+    mode: "0640"
+  notify: restart pgbouncer
+
+- name: Write pgbouncer.ini
+  ansible.builtin.template:
+    src: pgbouncer.ini.j2
+    dest: "{{ pgbouncer_conf_dir }}/pgbouncer.ini"
+    owner: root
+    group: postgres
+    mode: "0640"
+  notify: restart pgbouncer
+
+- name: Write pool_hba.conf
+  ansible.builtin.template:
+    src: pool_hba.conf.j2
+    dest: "{{ pgbouncer_conf_dir }}/pool_hba.conf"
+    owner: root
+    group: postgres
+    mode: "0640"
+  notify: restart pgbouncer
+
+- name: Create systemd override directory for PgBouncer
+  ansible.builtin.file:
+    path: /etc/systemd/system/pgbouncer.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install systemd override for PgBouncer
+  ansible.builtin.template:
+    src: pgbouncer.override.conf.j2
+    dest: /etc/systemd/system/pgbouncer.service.d/override.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd for pgbouncer
+
+- name: Install logrotate config
+  ansible.builtin.template:
+    src: pgbouncer.logrotate.j2
+    dest: /etc/logrotate.d/pgbouncer
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Flush handlers so config/unit are current before we start PgBouncer
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start PgBouncer
+  ansible.builtin.systemd:
+    name: pgbouncer
+    enabled: true
+    state: started
+
+- name: Wait for PgBouncer to bind its listen port
+  ansible.builtin.wait_for:
+    port: "{{ pgbouncer_port }}"
+    host: 127.0.0.1
+    timeout: 30

@@ -1,0 +1,200 @@
+---
+# =============================================================================
+# common — OS prep shared by every node: packages, NTP, hosts file, kernel
+# tuning, THP, firewall, PGDG repo. x86_64 only.
+# =============================================================================
+
+- name: Fail fast on non-x86_64 hosts
+  ansible.builtin.assert:
+    that: ansible_architecture == "x86_64"
+    fail_msg: >-
+      This playbook targets x86_64 only. {{ inventory_hostname }} reports
+      architecture '{{ ansible_architecture }}'.
+
+- name: Update apt cache and upgrade packages
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: safe
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+
+- name: Configure chrony
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart chrony
+
+- name: Ensure chrony is enabled and running
+  ansible.builtin.systemd:
+    name: chrony
+    enabled: true
+    state: started
+
+- name: Populate /etc/hosts with cluster node entries
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "## {mark} PG-HA-CLUSTER"
+    block: |
+      {% for host in groups['db_nodes'] %}
+      {{ hostvars[host].ansible_host }}    {{ host }}
+      {% endfor %}
+      {% for host in groups['proxy_nodes'] %}
+      {{ hostvars[host].ansible_host }} {{ host }}
+      {% endfor %}
+      {{ cluster_vip }}    pg-cluster-vip
+
+- name: Write sysctl tuning for PostgreSQL HA
+  ansible.builtin.template:
+    src: 90-pg-ha-cluster.conf.j2
+    dest: /etc/sysctl.d/90-pg-ha-cluster.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: apply sysctl
+
+- name: Write ulimits for postgres/root
+  ansible.builtin.template:
+    src: 90-pg-ha-cluster.limits.conf.j2
+    dest: /etc/security/limits.d/90-pg-ha-cluster.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install THP-disable systemd unit
+  ansible.builtin.template:
+    src: disable-thp.service.j2
+    dest: /etc/systemd/system/disable-thp.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd and enable thp service
+
+- name: Install CPU performance-governor systemd unit
+  ansible.builtin.template:
+    src: cpu-performance-governor.service.j2
+    dest: /etc/systemd/system/cpu-performance-governor.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd and enable cpu governor service
+
+- name: Add PGDG apt repository (key + repo in one deb822 source)
+  ansible.builtin.deb822_repository:
+    name: pgdg
+    types: deb
+    uris: https://apt.postgresql.org/pub/repos/apt
+    suites: "{{ ansible_distribution_release }}-pgdg"
+    components: main
+    architectures: amd64
+    signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    state: present
+  register: pgdg_repo_added
+
+- name: Refresh apt cache after adding PGDG repo
+  ansible.builtin.apt:
+    update_cache: true
+  when: pgdg_repo_added.changed
+
+- name: Reset UFW to known defaults
+  community.general.ufw:
+    state: reset
+  changed_when: false
+
+- name: UFW default policy — deny incoming
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: UFW default policy — allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+- name: UFW allow OpenSSH
+  community.general.ufw:
+    rule: allow
+    name: OpenSSH
+
+- name: UFW — DB node rules (Postgres, Patroni REST, etcd)
+  when: inventory_hostname in groups['db_nodes']
+  block:
+    - name: Allow Postgres from every DB and proxy node
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ hostvars[item].ansible_host }}"
+        to_port: "{{ pg_port | string }}"
+      loop: "{{ groups['db_nodes'] + groups['proxy_nodes'] }}"
+
+    - name: Allow Patroni REST API from proxy nodes
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ hostvars[item].ansible_host }}"
+        to_port: "{{ patroni_api_port | string }}"
+      loop: "{{ groups['proxy_nodes'] }}"
+
+    - name: Allow etcd client/peer traffic between DB nodes
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ hostvars[item].ansible_host }}"
+        to_port: "{{ port | string }}"
+      loop: "{{ groups['db_nodes'] }}"
+      loop_control:
+        loop_var: item
+      vars:
+        port: "{{ etcd_client_port }}"
+
+    - name: Allow etcd peer traffic between DB nodes
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ hostvars[item].ansible_host }}"
+        to_port: "{{ etcd_peer_port | string }}"
+      loop: "{{ groups['db_nodes'] }}"
+
+- name: UFW — proxy node rules (PgBouncer, HAProxy, VRRP)
+  when: inventory_hostname in groups['proxy_nodes']
+  block:
+    - name: Allow PgBouncer from app network
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ app_network }}"
+        to_port: "{{ pgbouncer_port | string }}"
+
+    - name: Allow HAProxy write/read from app network
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ app_network }}"
+        to_port: "{{ item | string }}"
+      loop:
+        - "{{ haproxy_write_port }}"
+        - "{{ haproxy_read_port }}"
+
+    - name: Allow HAProxy stats from ops network
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ ops_network }}"
+        to_port: "{{ haproxy_stats_port | string }}"
+
+    - name: Allow VRRP between proxy peers
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ hostvars[item].ansible_host }}"
+      loop: "{{ groups['proxy_nodes'] }}"
+      when: item != inventory_hostname
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled

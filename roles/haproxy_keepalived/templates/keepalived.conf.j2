@@ -1,0 +1,58 @@
+# =============================================================================
+# Keepalived configuration — managed by Ansible (role: haproxy_keepalived)
+# Node: {{ inventory_hostname }} ({{ ansible_host }})  Role: {{ vrrp_role }}
+# =============================================================================
+
+global_defs {
+    router_id             {{ inventory_hostname }}
+    script_user            root
+    enable_script_security
+    vrrp_skip_check_adv_addr
+}
+
+vrrp_script chk_proxy_services {
+    script       "{{ haproxy_keepalived_scripts_dir }}/check_services.sh"
+    interval     2
+    timeout      5
+    rise         2
+    fall         2
+    weight       -20
+}
+
+vrrp_instance VI_PG_CLUSTER {
+    state             {{ vrrp_role }}
+    interface          {{ vip_interface }}
+    virtual_router_id {{ vrrp_router_id }}
+    priority           {{ vrrp_priority }}
+    advert_int         1
+    preempt
+    preempt_delay      10
+{% if keepalived_unicast %}
+
+    unicast_src_ip     {{ ansible_host }}
+    unicast_peer {
+{% for host in groups['proxy_nodes'] %}
+{% if host != inventory_hostname %}
+        {{ hostvars[host].ansible_host }}
+{% endif %}
+{% endfor %}
+    }
+{% endif %}
+
+    authentication {
+        auth_type PASS
+        auth_pass {{ vrrp_auth_pass[:8] }}
+    }
+
+    virtual_ipaddress {
+        {{ cluster_vip }}/{{ vip_prefix }} dev {{ vip_interface }} label {{ vip_interface }}:vip
+    }
+
+    track_script {
+        chk_proxy_services
+    }
+
+    notify_master  "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_PG_CLUSTER MASTER"
+    notify_backup  "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_PG_CLUSTER BACKUP"
+    notify_fault   "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_PG_CLUSTER FAULT"
+}

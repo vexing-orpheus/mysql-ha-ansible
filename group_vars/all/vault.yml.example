@@ -1,0 +1,33 @@
+---
+# =============================================================================
+# Copy this file to vault.yml, fill in real passwords, then encrypt it:
+#   cp vault.yml.example vault.yml
+#   ansible-vault encrypt vault.yml
+#
+# Run playbooks with --ask-vault-pass, or point ANSIBLE_VAULT_PASSWORD_FILE
+# at a password file kept outside this repo.
+# =============================================================================
+
+repl_user: replicator
+repl_password: "CHANGE_ME"
+
+patroni_super_user: postgres
+patroni_super_pass: "CHANGE_ME"
+
+patroni_rewind_user: rewind_user
+patroni_rewind_pass: "CHANGE_ME"
+
+health_user: pgchecker
+health_pass: "CHANGE_ME"
+
+app_db: appdb
+app_db_user: appuser
+app_db_pass: "CHANGE_ME"
+
+pcp_user: pgbounceradmin
+pcp_pass: "CHANGE_ME"
+
+haproxy_stats_user: haproxyadmin
+haproxy_stats_pass: "CHANGE_ME"
+
+vrrp_auth_pass: "CHANGE_ME"

@@ -1,0 +1,28 @@
+---
+common_packages:
+  - curl
+  - ca-certificates
+  - gnupg
+  - wget
+  - vim
+  - htop
+  - net-tools
+  - dnsutils
+  - chrony
+  - sysstat
+  - python3
+  - python3-pip
+  - python3-psycopg2
+  - jq
+  - rsync
+  - ufw
+  - numactl
+  - pciutils
+  - nvme-cli
+
+vm_swappiness: 1
+vm_overcommit_memory: 2
+vm_overcommit_ratio: 80
+kernel_shmmax: 68719476736
+kernel_shmall: 4294967296
+fs_file_max: 1048576

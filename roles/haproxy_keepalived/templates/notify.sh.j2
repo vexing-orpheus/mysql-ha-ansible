@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Keepalived state-transition notifier — managed by Ansible (role: haproxy_keepalived)
+TYPE="$1"; NAME="$2"; STATE="$3"
+HOSTNAME=$(hostname -s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+logger -t keepalived "VIP transition: ${HOSTNAME} ${NAME} -> ${STATE} at ${TIMESTAMP}"
+case "${STATE}" in
+    MASTER) logger -t keepalived "This node acquired VIP — now MASTER" ;;
+    BACKUP) logger -t keepalived "This node released VIP — now BACKUP" ;;
+    FAULT)  logger -t keepalived "This node is FAULT — health check failing" ;;
+esac

@@ -1,0 +1,4 @@
+# PgBouncer userlist — managed by Ansible (role: pgbouncer)
+"{{ app_db_user }}"    "md5{{ (app_db_pass ~ app_db_user) | hash('md5') }}"
+"{{ patroni_super_user }}"  "md5{{ (patroni_super_pass ~ patroni_super_user) | hash('md5') }}"
+"{{ pcp_user }}"       "md5{{ (pcp_pass ~ pcp_user) | hash('md5') }}"

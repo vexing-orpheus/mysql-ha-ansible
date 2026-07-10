@@ -1,0 +1,12 @@
+---
+patroni_install_method: apt        # apt | pip — pip used automatically if apt package too old/missing
+patroni_min_version: "3.0"
+patroni_bin_apt: /usr/bin/patroni
+patroni_bin_pip: /usr/local/bin/patroni
+
+patroni_role_wait_retries: 60
+patroni_role_wait_delay: 2
+
+# Huge-page size on x86_64
+huge_page_size_bytes: 2097152
+huge_pages_spare: 256

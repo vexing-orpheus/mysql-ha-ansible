@@ -1,0 +1,10 @@
+---
+- name: reload systemd for patroni
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: reload patroni config
+  ansible.builtin.command: >
+    curl -s -XPOST http://127.0.0.1:{{ patroni_api_port }}/reload
+  changed_when: true
+  failed_when: false

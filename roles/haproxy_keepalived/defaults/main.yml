@@ -1,0 +1,2 @@
+---
+haproxy_keepalived_scripts_dir: /etc/keepalived/scripts

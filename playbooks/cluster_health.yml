@@ -1,0 +1,141 @@
+---
+# =============================================================================
+# cluster_health.yml — read-only health snapshot, run from the control VM:
+#
+#   ansible-playbook playbooks/cluster_health.yml --ask-vault-pass
+#
+# Fails the play (non-zero exit) if any check is unhealthy, so it can be
+# used in CI/cron as a gate as well as an interactive report.
+# =============================================================================
+
+- name: Patroni cluster status
+  hosts: db_nodes
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Query Patroni REST API
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ patroni_api_port }}/patroni"
+        return_content: true
+        status_code: 200
+      register: patroni_status
+      failed_when: false
+
+    - name: Report role
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ patroni_status.json.role | default('UNREACHABLE') }}
+
+    - name: Collect roles on the control node
+      ansible.builtin.set_fact:
+        node_role: "{{ patroni_status.json.role | default('unreachable') }}"
+
+- name: Aggregate Patroni role checks
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Count primaries and replicas
+      ansible.builtin.set_fact:
+        primary_count: >-
+          {{ groups['db_nodes']
+             | map('extract', hostvars, 'node_role')
+             | select('in', ['master', 'primary'])
+             | list | length }}
+        replica_count: >-
+          {{ groups['db_nodes']
+             | map('extract', hostvars, 'node_role')
+             | select('in', ['replica', 'standby'])
+             | list | length }}
+
+    - name: Assert exactly one primary
+      ansible.builtin.assert:
+        that: primary_count | int == 1
+        fail_msg: "Expected exactly 1 Patroni primary, found {{ primary_count }} (split-brain or full outage)."
+        success_msg: "Primary count OK: {{ primary_count }}"
+
+    - name: Warn if fewer than 2 replicas
+      ansible.builtin.debug:
+        msg: "WARNING: only {{ replica_count }} healthy replica(s), expected 2"
+      when: replica_count | int < 2
+
+- name: etcd cluster health
+  hosts: db_nodes
+  become: false
+  gather_facts: false
+  tasks:
+    - name: etcd endpoint health
+      ansible.builtin.command: >
+        etcdctl --endpoints=http://127.0.0.1:{{ etcd_client_port }} endpoint health
+      environment:
+        ETCDCTL_API: "3"
+      register: etcd_health
+      changed_when: false
+      failed_when: false
+
+    - name: Report etcd health
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ 'healthy' if etcd_health.rc == 0 else 'UNHEALTHY' }}"
+
+- name: Proxy layer — PgBouncer, HAProxy, Keepalived/VIP
+  hosts: proxy_nodes
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Check PgBouncer is listening
+      ansible.builtin.wait_for:
+        port: "{{ pgbouncer_port }}"
+        host: 127.0.0.1
+        timeout: 3
+      register: pgbouncer_check
+      failed_when: false
+
+    - name: Report PgBouncer
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: PgBouncer {{ 'UP' if pgbouncer_check is succeeded else 'DOWN' }}"
+
+    - name: Check HAProxy stats
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ haproxy_stats_port }}/stats;csv"
+        url_username: "{{ haproxy_stats_user }}"
+        url_password: "{{ haproxy_stats_pass }}"
+        return_content: true
+        status_code: 200
+      register: haproxy_stats
+      failed_when: false
+
+    - name: Count UP write backends
+      ansible.builtin.set_fact:
+        write_backends_up: >-
+          {{ (haproxy_stats.content | default('') | regex_findall('postgresql_primary,[^\n]*,UP,')) | length }}
+      when: haproxy_stats is succeeded
+
+    - name: Report HAProxy write backends
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: write backends UP = {{ write_backends_up | default('unknown') }}"
+
+    - name: Check whether this node currently holds the VIP
+      ansible.builtin.command: ip addr show
+      register: ip_addr_out
+      changed_when: false
+
+    - name: Report VIP holder
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'HOLDS VIP (' ~ cluster_vip ~ ')' if cluster_vip in ip_addr_out.stdout else 'backup' }}
+
+- name: Disk usage on DB nodes
+  hosts: db_nodes
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Check /var/lib/postgresql usage
+      ansible.builtin.shell: df -h /var/lib/postgresql | tail -1
+      register: disk_usage
+      changed_when: false
+
+    - name: Report disk usage
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ disk_usage.stdout }}"

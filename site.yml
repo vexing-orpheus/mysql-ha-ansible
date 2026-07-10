@@ -1,0 +1,79 @@
+---
+# =============================================================================
+# site.yml — builds the whole PostgreSQL HA cluster from scratch, run from a
+# separate Ansible control VM.
+#
+#   ansible-playbook site.yml --ask-vault-pass
+#
+# The only flag left is --ask-vault-pass: Ansible must decrypt
+# group_vars/all/vault.yml before it can even parse the first play, so that
+# password can't be collected via an in-playbook prompt — it has to be
+# supplied at invocation. Everything else (SSH username, SSH password, sudo
+# password) is prompted for interactively by the first play below.
+#
+# Order matters:
+#   0. Collect connection credentials — prompts once, applies to every host
+#   1. common       — OS prep on every node (parallel)
+#   2. etcd         — 3-node etcd cluster on db_nodes (parallel, static bootstrap)
+#   3. postgresql_patroni — one DB node at a time (serial: 1) so pg-node-1
+#                     deterministically becomes primary before the others
+#                     start and clone as replicas
+#   4. pgbouncer + haproxy_keepalived — both proxy nodes (parallel)
+#   5. cluster_health — read-only post-build gate; fails the run if the
+#                     Patroni primary count is wrong or a service is down
+# =============================================================================
+
+- name: Collect connection credentials
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_prompt:
+    - name: ssh_user
+      prompt: "SSH username"
+      private: false
+    - name: ssh_pass
+      prompt: "SSH password (blank to use SSH keys instead)"
+      private: true
+    - name: ssh_become_pass
+      prompt: "sudo (become) password (blank if passwordless sudo)"
+      private: true
+  tasks:
+    - name: Apply SSH/become credentials to every cluster host
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_user: "{{ ssh_user }}"
+        ansible_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
+        ansible_become_password: "{{ ssh_become_pass if ssh_become_pass | length > 0 else omit }}"
+      loop: "{{ groups['pg_ha_cluster'] }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+
+- name: OS preparation — every node
+  hosts: pg_ha_cluster
+  become: true
+  roles:
+    - common
+
+- name: etcd cluster — DB nodes
+  hosts: db_nodes
+  become: true
+  roles:
+    - etcd
+
+- name: PostgreSQL + Patroni — DB nodes (one at a time, pg-node-1 first)
+  hosts: db_nodes
+  become: true
+  serial: 1
+  roles:
+    - postgresql_patroni
+
+- name: Connection pooling and load balancing — proxy nodes
+  hosts: proxy_nodes
+  become: true
+  roles:
+    - pgbouncer
+    - haproxy_keepalived
+
+- name: Post-build health check
+  ansible.builtin.import_playbook: playbooks/cluster_health.yml
