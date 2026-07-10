@@ -8,8 +8,9 @@
 # The only flag left is --ask-vault-pass: Ansible must decrypt
 # group_vars/all/vault.yml before it can even parse the first play, so that
 # password can't be collected via an in-playbook prompt — it has to be
-# supplied at invocation. Everything else (SSH username, SSH password, sudo
-# password) is prompted for interactively by the first play below.
+# supplied at invocation. Everything else (SSH username, and one password
+# used for both SSH login and sudo/become) is prompted for interactively by
+# the first play below.
 #
 # Order matters:
 #   0. Collect connection credentials — prompts once, applies to every host
@@ -32,10 +33,7 @@
       prompt: "SSH username"
       private: false
     - name: ssh_pass
-      prompt: "SSH password (blank to use SSH keys instead)"
-      private: true
-    - name: ssh_become_pass
-      prompt: "sudo (become) password (blank if passwordless sudo)"
+      prompt: "SSH / sudo password (blank to use SSH keys + passwordless sudo)"
       private: true
   tasks:
     - name: Apply SSH/become credentials to every cluster host
@@ -43,7 +41,7 @@
         name: "{{ item }}"
         ansible_user: "{{ ssh_user }}"
         ansible_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
-        ansible_become_password: "{{ ssh_become_pass if ssh_become_pass | length > 0 else omit }}"
+        ansible_become_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
       loop: "{{ groups['pg_ha_cluster'] }}"
       loop_control:
         label: "{{ item }}"

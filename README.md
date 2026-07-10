@@ -65,11 +65,11 @@ ansible-playbook site.yml --ask-vault-pass
 `--ask-vault-pass` is the only flag needed — Ansible has to decrypt
 `group_vars/all/vault.yml` before it can parse the first play at all, so
 that password can't be collected any other way. Everything else (SSH
-username, SSH password, sudo/become password) is prompted for
-interactively by `site.yml`'s own first play, which then applies those
-credentials to all 5 hosts for the rest of the run. To pass extra options
-through (e.g. `--limit`, `-e pg_version=16`), just append them:
-`ansible-playbook site.yml --ask-vault-pass --limit pg-node-1`.
+username, and one password used for both SSH login and sudo/become) is
+prompted for interactively by `site.yml`'s own first play, which then
+applies those credentials to all 5 hosts for the rest of the run. To pass
+extra options through (e.g. `--limit`, `-e pg_version=16`), just append
+them: `ansible-playbook site.yml --ask-vault-pass --limit pg-node-1`.
 
 If your nodes use SSH keys rather than password auth, leave the SSH
 password prompt blank when it appears — key-based auth will be used
