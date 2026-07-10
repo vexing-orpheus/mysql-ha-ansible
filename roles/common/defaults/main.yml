@@ -26,3 +26,12 @@ vm_overcommit_ratio: 80
 kernel_shmmax: 68719476736
 kernel_shmall: 4294967296
 fs_file_max: 1048576
+
+# ── Hardware requirements ────────────────────────────────────────────────
+# Hard minimums (any node): fails the play if unmet.
+min_cpu_vcpus: 4
+min_ram_mb: 7800          # ~8GB; leaves headroom for firmware/hypervisor-reserved memory
+min_os_disk_gb: 50
+# Recommended-only (DB nodes): reported as a warning, never fails the play.
+db_recommended_cpu_vcpus: 8
+db_recommended_ram_mb: 16384

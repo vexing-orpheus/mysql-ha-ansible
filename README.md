@@ -24,6 +24,18 @@ pg-ha-ansible/
     └── haproxy_keepalived   # read/write routing + VIP failover (proxy_nodes)
 ```
 
+## Hardware requirements
+
+Minimum per node (DB or proxy), enforced by the `common` role at the start
+of every run — the play fails fast on any node that doesn't meet these:
+
+- **CPU**: 4 vCPUs (8+ recommended for DB nodes — warns, doesn't fail, if unmet)
+- **RAM**: 8 GB (16 GB+ recommended for DB nodes — warns, doesn't fail, if unmet)
+- **Disk**: 50 GB OS volume, **plus a separate data volume for DB nodes**
+  mounted under the PostgreSQL data directory (or a parent of it, e.g.
+  `/var/lib/postgresql`) — DB nodes fail the play if no such dedicated
+  volume is detected.
+
 ## 1. Control VM setup
 
 On a separate VM (not one of the 5 cluster nodes):

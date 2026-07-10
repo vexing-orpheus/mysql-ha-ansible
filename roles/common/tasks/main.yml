@@ -11,6 +11,77 @@
       This playbook targets x86_64 only. {{ inventory_hostname }} reports
       architecture '{{ ansible_architecture }}'.
 
+- name: Determine detected vCPU count
+  ansible.builtin.set_fact:
+    detected_vcpus: "{{ ansible_processor_vcpus | default(ansible_processor_count) }}"
+
+- name: Fail fast on insufficient CPU
+  ansible.builtin.assert:
+    that: detected_vcpus | int >= min_cpu_vcpus
+    fail_msg: >-
+      {{ inventory_hostname }} has {{ detected_vcpus }} vCPU(s); minimum is
+      {{ min_cpu_vcpus }}.
+
+- name: Fail fast on insufficient RAM
+  ansible.builtin.assert:
+    that: ansible_memtotal_mb | int >= min_ram_mb
+    fail_msg: >-
+      {{ inventory_hostname }} has {{ ansible_memtotal_mb }}MB RAM; minimum
+      is {{ min_ram_mb }}MB (~8GB).
+
+- name: Find the OS root filesystem's mount facts
+  ansible.builtin.set_fact:
+    root_mount: "{{ ansible_mounts | selectattr('mount', 'equalto', '/') | first }}"
+
+- name: Fail fast on undersized OS volume
+  ansible.builtin.assert:
+    that: root_mount.size_total | int >= (min_os_disk_gb * 1024 * 1024 * 1024)
+    fail_msg: >-
+      {{ inventory_hostname }} root filesystem is
+      {{ (root_mount.size_total | int / (1024 * 1024 * 1024)) | round(1) }}GB;
+      minimum OS volume size is {{ min_os_disk_gb }}GB.
+
+- name: Warn if a DB node is below the recommended CPU/RAM sizing
+  ansible.builtin.debug:
+    msg: >-
+      RECOMMENDATION: {{ inventory_hostname }} is a DB node with
+      {{ detected_vcpus }} vCPU / {{ ansible_memtotal_mb }}MB RAM detected.
+      DB nodes are recommended to have at least {{ db_recommended_cpu_vcpus }}
+      vCPU / {{ db_recommended_ram_mb }}MB RAM.
+  when: >-
+    inventory_hostname in groups['db_nodes'] and
+    (detected_vcpus | int < db_recommended_cpu_vcpus or
+     ansible_memtotal_mb | int < db_recommended_ram_mb)
+
+- name: Enforce a dedicated data volume on DB nodes
+  when: inventory_hostname in groups['db_nodes']
+  block:
+    - name: Start from the OS root volume as the fallback data-directory mount
+      ansible.builtin.set_fact:
+        pg_data_mount: "{{ root_mount }}"
+
+    - name: Find the most specific mount point backing the PostgreSQL data directory
+      ansible.builtin.set_fact:
+        pg_data_mount: "{{ item }}"
+      loop: "{{ ansible_mounts }}"
+      loop_control:
+        label: "{{ item.mount }}"
+      when: >-
+        (item.mount == pg_data_dir or
+         pg_data_dir.startswith(item.mount.rstrip('/') + '/')) and
+        item.mount | length > pg_data_mount.mount | length
+
+    - name: Assert the data directory is on a separate volume from the OS
+      ansible.builtin.assert:
+        that: pg_data_mount.device != root_mount.device
+        fail_msg: >-
+          {{ inventory_hostname }}: no dedicated data volume detected for
+          {{ pg_data_dir }} — it resolves to the same device
+          ({{ pg_data_mount.device }}) as the OS root volume ({{ root_mount.mount }}).
+          DB nodes require {{ pg_data_dir }} (or a parent directory, e.g.
+          /var/lib/postgresql) mounted on its own volume, separate from
+          the 50GB OS volume.
+
 - name: Update apt cache and upgrade packages
   ansible.builtin.apt:
     update_cache: true
