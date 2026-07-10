@@ -59,3 +59,14 @@ pgbouncer_max_client_conn: 1000
 pgbouncer_default_pool_size: 20
 pgbouncer_min_pool_size: 5
 pgbouncer_reserve_pool_size: 5
+
+# ── Backups / archiving / alerts ──────────────────────────────────────────
+# Global (not role defaults) because playbooks/cluster_health.yml can run
+# standalone, without the pgbackrest role ever having run in that process.
+# alert_webhook_url itself lives in group_vars/all/vault.yml (secret-ish —
+# whoever has the URL can post to your channel).
+alert_webhook_payload_key: text   # "text" for Slack, "content" for Discord
+
+# How stale the most recent successful backup is allowed to be before
+# cluster_health.yml reports it unhealthy.
+pgbackrest_backup_freshness_hours: 26

@@ -1,0 +1,23 @@
+# =============================================================================
+# pgbackrest.conf — managed by Ansible (role: pgbackrest)
+# Node: {{ inventory_hostname }}
+#
+# Repo is LOCAL to this node (see README "Backups, archiving & alerts"): the
+# backup chain here only grows while this node is the Patroni primary. After
+# a failover, whichever node becomes primary starts a fresh full backup on
+# its next scheduled run — pgBackRest handles that automatically.
+# =============================================================================
+
+[global]
+repo1-path={{ pgbackrest_repo_path }}
+repo1-retention-full={{ pgbackrest_retention_full }}
+repo1-retention-diff={{ pgbackrest_retention_diff }}
+repo1-compress-type=zst
+start-fast=y
+log-path={{ pgbackrest_log_path }}
+process-max=2
+
+[{{ patroni_scope }}]
+pg1-path={{ pg_data_dir }}
+pg1-port={{ pg_port }}
+pg1-socket-path=/var/run/postgresql

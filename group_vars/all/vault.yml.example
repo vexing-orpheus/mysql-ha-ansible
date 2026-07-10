@@ -31,3 +31,8 @@ haproxy_stats_user: haproxyadmin
 haproxy_stats_pass: "CHANGE_ME"
 
 vrrp_auth_pass: "CHANGE_ME"
+
+# Slack/Discord-style incoming webhook URL used for backup, archiving, and
+# cluster_health.yml alerts. Anyone with this URL can post to your channel,
+# so it lives here rather than in 01-vars.yml.
+alert_webhook_url: "https://hooks.slack.com/services/CHANGE_ME"

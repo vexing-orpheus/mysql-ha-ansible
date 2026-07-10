@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# pgBackRest restore verification — managed by Ansible (role: pgbackrest)
+#
+# Restores the latest backup into a scratch directory, boots a temporary
+# Postgres instance on a throwaway port, runs a liveness query, then tears
+# it all down. Never touches the real data directory or port. Only runs on
+# a replica (not the primary), to keep restore-test I/O off the primary.
+set -uo pipefail
+
+STANZA="{{ patroni_scope }}"
+SCRATCH="{{ pgbackrest_restore_verify_path }}"
+PORT="{{ pgbackrest_restore_verify_port }}"
+BIN_DIR="/usr/lib/postgresql/{{ pg_version }}/bin"
+ALERT="{{ pgbackrest_scripts_dir }}/alert.sh"
+
+ROLE=$(curl -fsS "http://127.0.0.1:{{ patroni_api_port }}/patroni" 2>/dev/null | jq -r '.role // empty')
+
+if [[ "${ROLE}" == "master" || "${ROLE}" == "primary" ]]; then
+    exit 0
+fi
+
+cleanup() {
+    "${BIN_DIR}/pg_ctl" -D "${SCRATCH}" -m immediate stop >/dev/null 2>&1 || true
+    rm -rf "${SCRATCH:?}"/*
+}
+trap cleanup EXIT
+
+fail() {
+    "${ALERT}" "Restore verification FAILED for stanza ${STANZA}: $1"
+    exit 1
+}
+
+rm -rf "${SCRATCH:?}"/*
+
+pgbackrest --stanza="${STANZA}" --pg1-path="${SCRATCH}" --set=latest restore \
+    || fail "pgbackrest restore command failed"
+
+"${BIN_DIR}/pg_ctl" -D "${SCRATCH}" -o "-p ${PORT} -c unix_socket_directories=/tmp" -l "${SCRATCH}/verify.log" start \
+    || fail "temporary Postgres instance failed to start"
+
+READY=0
+for _ in $(seq 1 30); do
+    if "${BIN_DIR}/pg_isready" -p "${PORT}" -h /tmp >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 1
+done
+[[ "${READY}" -eq 1 ]] || fail "temporary Postgres instance never became ready"
+
+"${BIN_DIR}/psql" -p "${PORT}" -h /tmp -U postgres -d postgres -c "SELECT 1;" >/dev/null \
+    || fail "liveness query against restored instance failed"
+
+logger -t pgbackrest-restore-verify "Restore verification OK for stanza ${STANZA} on $(hostname -s)"

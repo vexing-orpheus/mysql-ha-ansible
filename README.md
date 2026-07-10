@@ -20,6 +20,7 @@ pg-ha-ansible/
     ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, PGDG repo
     ├── etcd                 # 3-node etcd cluster (db_nodes)
     ├── postgresql_patroni   # PostgreSQL + Patroni (db_nodes)
+    ├── pgbackrest           # WAL archiving, backup/check/restore-verify cron (db_nodes)
     ├── pgbouncer            # connection pooler (proxy_nodes)
     └── haproxy_keepalived   # read/write routing + VIP failover (proxy_nodes)
 ```
@@ -64,7 +65,7 @@ so nothing is hardcoded in `ansible.cfg`.
 3. **Secrets** —
    ```bash
    cp group_vars/all/vault.yml.example group_vars/all/vault.yml
-   vi group_vars/all/vault.yml        # set real passwords
+   vi group_vars/all/vault.yml        # set real passwords + alert_webhook_url
    ansible-vault encrypt group_vars/all/vault.yml
    ```
 
@@ -103,13 +104,18 @@ This runs, in order:
    cluster, and the others detect the existing leader key and clone as
    replicas automatically. Running this play `serial: 1` just makes that
    deterministic instead of a race.
-4. **pgbouncer** + **haproxy_keepalived** on both proxy nodes in parallel.
-5. **cluster_health** (imported from `playbooks/cluster_health.yml`) —
+4. **pgbackrest** on the 3 DB nodes in parallel — WAL archiving, and cron
+   jobs for scheduled backups, an integrity check, and restore verification.
+   See "Backups, archiving & alerts" below.
+5. **pgbouncer** + **haproxy_keepalived** on both proxy nodes in parallel.
+6. **cluster_health** (imported from `playbooks/cluster_health.yml`) —
    reports Patroni role per node (asserts exactly one primary), etcd
-   health, PgBouncer/HAProxy status per proxy node, which node currently
-   holds the VIP, and DB-node disk usage. Non-zero exit if the
-   primary-count assertion fails, so `site.yml` itself fails the run if
-   the cluster comes up unhealthy.
+   health, WAL archiver failures, backup freshness, PgBouncer/HAProxy
+   status per proxy node, which node currently holds the VIP, and DB-node
+   disk usage. Sends a consolidated alert to `alert_webhook_url` if
+   anything is unhealthy, then exits non-zero if the primary-count
+   assertion fails, so `site.yml` itself fails the run if the cluster
+   comes up unhealthy.
 
 Each role waits on real state (etcd health, Patroni role, HAProxy stats
 page, PgBouncer's listening port) before moving on, so a partial failure
@@ -124,6 +130,70 @@ whole build (e.g. from cron/CI), run it standalone:
 ```bash
 ./run.sh playbooks/cluster_health.yml
 ```
+
+## Backups, archiving & alerts
+
+Backups and WAL archiving are handled by pgBackRest (`roles/pgbackrest`),
+installed on all 3 DB nodes. `postgresql_patroni` sets `archive_mode`,
+`archive_command`, and `restore_command` in `patroni.yml` so archiving is
+wired up from the moment Postgres starts — there's a brief harmless window
+during a fresh `site.yml` run where WAL archive attempts fail because
+`pgbackrest` hasn't been installed yet (that happens in the very next play);
+it self-heals automatically once the `pgbackrest` play finishes, no restart
+needed.
+
+**Repo is local disk, per node** (`pgbackrest_repo_path`, default
+`/var/lib/pgbackrest`) — deliberately not S3/NFS. Because Patroni's primary
+floats across `pg-node-1/2/3`, a node's local backup chain only grows while
+it's primary. After a failover, the new primary has no local chain yet, so
+its next scheduled backup is automatically a full backup instead of an
+incremental/diff one — pgBackRest handles this on its own, it's just worth
+knowing you'll see an extra full backup after every failover. If you'd
+rather backups survive independently of which node is primary, point
+`pgbackrest_repo_path` at a shared mount or switch the role to an
+S3-compatible `repo1-type` — not done here to keep the setup dependency-free.
+
+**Schedule** (all in `group_vars/all/01-vars.yml` /
+`roles/pgbackrest/defaults/main.yml`, overridable):
+- Full backup: weekly, Sunday 01:00. Diff backup: daily (except Sunday) 01:00.
+- Integrity check (`pgbackrest check` — WAL/manifest checksums, no restore): daily 05:00.
+- Restore verification: weekly, Sunday 03:00.
+
+All of the above run via cron **on all 3 DB nodes**, but a wrapper script
+checks Patroni's role via its REST API first: backup/check exit immediately
+unless the node is currently the leader; restore-verify exits immediately
+*unless* it's a replica, so it never competes with the primary for I/O.
+
+**Restore verification** actually proves a backup is usable, not just
+present: it restores the latest backup into a scratch directory
+(`pgbackrest_restore_verify_path`), boots a temporary Postgres instance on a
+throwaway port (`pgbackrest_restore_verify_port`, default 5555), runs a
+liveness query, then tears both down. To hand-trigger it instead of waiting
+for the weekly cron:
+```bash
+sudo -u postgres /usr/local/lib/pgbackrest-scripts/restore_verify.sh
+```
+
+**Alerts** go to `alert_webhook_url` (in `group_vars/all/vault.yml`, a
+Slack/Discord-style incoming webhook — treat it as a secret, anyone with the
+URL can post to your channel). `alert_webhook_payload_key` controls the JSON
+key used (`text` for Slack, `content` for Discord; Microsoft Teams needs a
+fuller adaptive-card payload and isn't supported by this simple webhook
+POST). Two independent alert paths:
+- Each cron script (`backup.sh`, `check.sh`, `restore_verify.sh`) posts
+  immediately on its own failure, via the shared
+  `roles/pgbackrest/templates/alert.sh.j2` helper.
+- `playbooks/cluster_health.yml`'s final play aggregates *everything* it
+  checked (Patroni roles, etcd, WAL archiver failures, backup freshness vs.
+  `pgbackrest_backup_freshness_hours`, PgBouncer/HAProxy) and posts one
+  consolidated message if anything is unhealthy — this is what catches a
+  problem even if the immediate cron-side alert never fired (e.g. the node
+  couldn't reach the webhook URL at the time).
+
+To test the alert path end-to-end: point `alert_webhook_url` at a real test
+channel, then stop `etcd` on one node and rerun
+`./run.sh playbooks/cluster_health.yml` — a failure message should land in
+the channel.
 
 ## Re-running / making changes
 

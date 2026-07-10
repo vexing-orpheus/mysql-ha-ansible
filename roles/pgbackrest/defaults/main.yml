@@ -1,0 +1,41 @@
+---
+# The pgBackRest stanza is just patroni_scope — one variable for "the name
+# of this cluster" instead of two, and it keeps this role decoupled from
+# needing its own var available before postgresql_patroni renders
+# patroni.yml.j2 (which runs first, in an earlier play).
+pgbackrest_repo_path: /var/lib/pgbackrest
+pgbackrest_log_path: /var/log/pgbackrest
+pgbackrest_scripts_dir: /usr/local/lib/pgbackrest-scripts
+
+# Retention — full backups kept, and diff backups kept per full backup cycle.
+pgbackrest_retention_full: 4
+pgbackrest_retention_diff: 2
+
+# Cron schedules (minute hour dom month dow). Defaults: full backup Sunday
+# 01:00, diff backup daily (except Sunday) 01:00, integrity check daily
+# 05:00, full restore-verify weekly Sunday 03:00 (replicas only).
+pgbackrest_full_backup_cron:
+  minute: "0"
+  hour: "1"
+  weekday: "0"
+pgbackrest_diff_backup_cron:
+  minute: "0"
+  hour: "1"
+  weekday: "1-6"
+pgbackrest_check_cron:
+  minute: "0"
+  hour: "5"
+pgbackrest_restore_verify_cron:
+  minute: "0"
+  hour: "3"
+  weekday: "0"
+
+# Scratch location/port used by the weekly restore-verify test — never
+# touches the real data directory or port.
+pgbackrest_restore_verify_path: /var/lib/pgbackrest_restore_test
+pgbackrest_restore_verify_port: 5555
+
+# pgbackrest_backup_freshness_hours and alert_webhook_payload_key live in
+# group_vars/all/01-vars.yml, not here — playbooks/cluster_health.yml can be
+# run standalone (without this role ever having run in that process), so
+# anything it needs must be globally defined rather than a role default.

@@ -19,8 +19,14 @@
 #   3. postgresql_patroni — one DB node at a time (serial: 1) so pg-node-1
 #                     deterministically becomes primary before the others
 #                     start and clone as replicas
-#   4. pgbouncer + haproxy_keepalived — both proxy nodes (parallel)
-#   5. cluster_health — read-only post-build gate; fails the run if the
+#   4. pgbackrest   — WAL archiving, backup/check/restore-verify cron on
+#                     db_nodes (parallel). archive_command was already set
+#                     in step 3's patroni.yml, so there's a brief harmless
+#                     window between Patroni starting and this step
+#                     installing pgbackrest where WAL archiving attempts
+#                     fail — it self-heals as soon as this step finishes.
+#   5. pgbouncer + haproxy_keepalived — both proxy nodes (parallel)
+#   6. cluster_health — read-only post-build gate; fails the run if the
 #                     Patroni primary count is wrong or a service is down
 # =============================================================================
 
@@ -65,6 +71,12 @@
   serial: 1
   roles:
     - postgresql_patroni
+
+- name: Backups, WAL archiving, restore verification — DB nodes
+  hosts: db_nodes
+  become: true
+  roles:
+    - pgbackrest
 
 - name: Connection pooling and load balancing — proxy nodes
   hosts: proxy_nodes

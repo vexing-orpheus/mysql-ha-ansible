@@ -31,34 +31,52 @@
       ansible.builtin.set_fact:
         node_role: "{{ patroni_status.json.role | default('unreachable') }}"
 
-- name: Aggregate Patroni role checks
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  tasks:
-    - name: Count primaries and replicas
+    - name: Check WAL archiver failures
+      community.postgresql.postgresql_query:
+        login_user: "{{ health_user }}"
+        login_password: "{{ health_pass }}"
+        login_host: 127.0.0.1
+        login_port: "{{ pg_port }}"
+        db: postgres
+        query: "SELECT failed_count, last_archived_time, last_failed_time FROM pg_stat_archiver"
+      register: archiver_status
+      failed_when: false
+
+    - name: Set archiver_failed_count fact
       ansible.builtin.set_fact:
-        primary_count: >-
-          {{ groups['db_nodes']
-             | map('extract', hostvars, 'node_role')
-             | select('in', ['master', 'primary'])
-             | list | length }}
-        replica_count: >-
-          {{ groups['db_nodes']
-             | map('extract', hostvars, 'node_role')
-             | select('in', ['replica', 'standby'])
-             | list | length }}
+        archiver_failed_count: "{{ archiver_status.query_result[0].failed_count | default(0) if archiver_status is succeeded else 0 }}"
 
-    - name: Assert exactly one primary
-      ansible.builtin.assert:
-        that: primary_count | int == 1
-        fail_msg: "Expected exactly 1 Patroni primary, found {{ primary_count }} (split-brain or full outage)."
-        success_msg: "Primary count OK: {{ primary_count }}"
-
-    - name: Warn if fewer than 2 replicas
+    - name: Report WAL archiver status
       ansible.builtin.debug:
-        msg: "WARNING: only {{ replica_count }} healthy replica(s), expected 2"
-      when: replica_count | int < 2
+        msg: >-
+          {{ inventory_hostname }}: WAL archiver failed_count={{ archiver_failed_count }},
+          last_archived={{ archiver_status.query_result[0].last_archived_time | default('never') if archiver_status is succeeded else 'UNKNOWN' }}
+
+    - name: Check pgbackrest backup freshness (current primary only)
+      when: node_role in ['master', 'primary']
+      block:
+        - name: Verify the most recent backup is within the freshness threshold
+          ansible.builtin.shell: |
+            set -o pipefail
+            latest=$(pgbackrest --stanza={{ patroni_scope }} info --output=json | jq -r '.[0].backup[-1].timestamp.stop // 0')
+            now=$(date +%s)
+            age_hours=$(( (now - latest) / 3600 ))
+            [ "${latest}" -gt 0 ] && [ "${age_hours}" -lt {{ pgbackrest_backup_freshness_hours }} ]
+          register: backup_freshness_check
+          changed_when: false
+          failed_when: false
+          args:
+            executable: /bin/bash
+
+        - name: Set backup_stale fact
+          ansible.builtin.set_fact:
+            backup_stale: "{{ backup_freshness_check.rc != 0 }}"
+
+        - name: Report backup freshness
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: most recent backup is
+              {{ 'STALE (older than ' ~ pgbackrest_backup_freshness_hours ~ 'h) or missing' if backup_stale else 'fresh' }}
 
 - name: etcd cluster health
   hosts: db_nodes
@@ -139,3 +157,94 @@
     - name: Report disk usage
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: {{ disk_usage.stdout }}"
+
+- name: Aggregate results, alert, and gate on cluster health
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Count primaries and replicas
+      ansible.builtin.set_fact:
+        primary_count: >-
+          {{ groups['db_nodes']
+             | map('extract', hostvars, 'node_role')
+             | select('in', ['master', 'primary'])
+             | list | length }}
+        replica_count: >-
+          {{ groups['db_nodes']
+             | map('extract', hostvars, 'node_role')
+             | select('in', ['replica', 'standby'])
+             | list | length }}
+
+    - name: Start with an empty problem list
+      ansible.builtin.set_fact:
+        health_problems: []
+
+    - name: Flag unreachable or missing Patroni roles
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ': Patroni role UNREACHABLE'] }}"
+      loop: "{{ groups['db_nodes'] }}"
+      when: hostvars[item].node_role | default('unreachable') == 'unreachable'
+
+    - name: Flag wrong primary count
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + ['Expected exactly 1 Patroni primary, found ' ~ primary_count ~ ' (split-brain or full outage)'] }}"
+      when: primary_count | int != 1
+
+    - name: Flag etcd member health
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ': etcd UNHEALTHY'] }}"
+      loop: "{{ groups['db_nodes'] }}"
+      when: (hostvars[item].etcd_health.rc | default(1)) != 0
+
+    - name: Flag WAL archiving failures
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ': WAL archiving has ' ~ (hostvars[item].archiver_failed_count | default(0)) ~ ' failed attempt(s)'] }}"
+      loop: "{{ groups['db_nodes'] }}"
+      when: (hostvars[item].archiver_failed_count | default(0) | int) > 0
+
+    - name: Flag a stale or missing backup on the current primary
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ': most recent backup is stale or missing (older than ' ~ pgbackrest_backup_freshness_hours ~ 'h)'] }}"
+      loop: "{{ groups['db_nodes'] }}"
+      when: hostvars[item].backup_stale | default(false)
+
+    - name: Flag PgBouncer down
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ': PgBouncer DOWN'] }}"
+      loop: "{{ groups['proxy_nodes'] }}"
+      when: hostvars[item].pgbouncer_check is not succeeded
+
+    - name: Flag no HAProxy write backends up
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ': no HAProxy write backends UP'] }}"
+      loop: "{{ groups['proxy_nodes'] }}"
+      when: >-
+        hostvars[item].haproxy_stats is succeeded and
+        (hostvars[item].write_backends_up | default(0) | int) == 0
+
+    - name: Report final health summary
+      ansible.builtin.debug:
+        msg: "{{ health_problems if health_problems | length > 0 else ['All checks healthy'] }}"
+
+    - name: Send a consolidated alert if any problems were found
+      ansible.builtin.uri:
+        url: "{{ alert_webhook_url }}"
+        method: POST
+        body_format: json
+        body: >-
+          {{ {alert_webhook_payload_key: ('pg-ha-cluster health check failed:\n' ~ (health_problems | join('\n')))} }}
+        status_code: [200, 204]
+      when: health_problems | length > 0
+      failed_when: false
+
+    - name: Warn if fewer than 2 replicas
+      ansible.builtin.debug:
+        msg: "WARNING: only {{ replica_count }} healthy replica(s), expected 2"
+      when: replica_count | int < 2
+
+    - name: Assert exactly one primary
+      ansible.builtin.assert:
+        that: primary_count | int == 1
+        fail_msg: "Expected exactly 1 Patroni primary, found {{ primary_count }} (split-brain or full outage)."
+        success_msg: "Primary count OK: {{ primary_count }}"

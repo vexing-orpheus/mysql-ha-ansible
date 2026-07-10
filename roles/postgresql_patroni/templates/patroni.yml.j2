@@ -35,6 +35,10 @@ bootstrap:
         wal_keep_size: 1024
         hot_standby_feedback: "on"
 
+        archive_mode: "on"
+        archive_command: 'pgbackrest --stanza={{ patroni_scope }} archive-push %p'
+        restore_command: 'pgbackrest --stanza={{ patroni_scope }} archive-get %f "%p"'
+
         max_connections: 200
 
         shared_buffers: '{{ shared_buffers }}'
