@@ -2,31 +2,87 @@
 # =============================================================================
 # cluster_health.yml — read-only health snapshot, run from the control VM:
 #
-#   ansible-playbook playbooks/cluster_health.yml --ask-vault-pass
+#   ansible-playbook playbooks/cluster_health.yml
 #
 # Fails the play (non-zero exit) if any check is unhealthy, so it can be
 # used in CI/cron as a gate as well as an interactive report.
 # =============================================================================
 
-- name: Collect cluster VIP (standalone runs only)
+- name: Collect secrets and VIP (standalone runs only)
   hosts: localhost
   connection: local
   gather_facts: false
+  vars:
+    # True only when this playbook runs on its own — site.yml's own
+    # credentials play already sets cluster_vip (and everything else below)
+    # on every host by the time this play would run as part of that import.
+    standalone_run: "{{ hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined }}"
   tasks:
-    # Skipped when this playbook runs as part of site.yml — its own
-    # credentials play already set cluster_vip on every host by this point.
+    - name: Prompt for health-check DB username
+      ansible.builtin.pause:
+        prompt: "Health-check DB username [pgchecker]"
+      register: p_health_user
+      when: standalone_run
+
+    - name: Prompt for health-check DB password
+      ansible.builtin.pause:
+        prompt: "Health-check DB password"
+        echo: false
+      register: p_health_pass
+      when: standalone_run
+      no_log: true
+
+    - name: Prompt for HAProxy stats username
+      ansible.builtin.pause:
+        prompt: "HAProxy stats username [haproxyadmin]"
+      register: p_haproxy_stats_user
+      when: standalone_run
+
+    - name: Prompt for HAProxy stats password
+      ansible.builtin.pause:
+        prompt: "HAProxy stats password"
+        echo: false
+      register: p_haproxy_stats_pass
+      when: standalone_run
+      no_log: true
+
+    - name: Prompt for alert webhook URL
+      ansible.builtin.pause:
+        prompt: "Alert webhook URL (blank to disable alerts)"
+      register: p_alert_webhook_url
+      when: standalone_run
+
     - name: Prompt for cluster VIP
       ansible.builtin.pause:
         prompt: "Cluster VIP address (used to check which proxy node currently holds it)"
-      register: vip_prompt
-      when: hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined
+      register: p_cluster_vip
+      when: standalone_run
 
-    - name: Apply cluster VIP to proxy nodes
+    - name: Apply health-check credentials to DB nodes
       ansible.builtin.add_host:
         name: "{{ item }}"
-        cluster_vip: "{{ vip_prompt.user_input | default('10.223.16.79', true) }}"
+        health_user: "{{ p_health_user.user_input | default('pgchecker', true) }}"
+        health_pass: "{{ p_health_pass.user_input | default('', true) }}"
+      loop: "{{ groups['db_nodes'] }}"
+      when: standalone_run
+      no_log: true
+
+    - name: Apply HAProxy stats credentials and VIP to proxy nodes
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        haproxy_stats_user: "{{ p_haproxy_stats_user.user_input | default('haproxyadmin', true) }}"
+        haproxy_stats_pass: "{{ p_haproxy_stats_pass.user_input | default('', true) }}"
+        cluster_vip: "{{ p_cluster_vip.user_input | default('10.223.16.79', true) }}"
       loop: "{{ groups['proxy_nodes'] }}"
-      when: hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined
+      when: standalone_run
+      no_log: true
+
+    - name: Apply alert webhook URL to the control node
+      ansible.builtin.add_host:
+        name: localhost
+        alert_webhook_url: "{{ p_alert_webhook_url.user_input | default('', true) }}"
+      when: standalone_run
+      no_log: true
 
 - name: Patroni cluster status
   hosts: db_nodes

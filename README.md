@@ -12,9 +12,8 @@ pg-ha-ansible/
 ├── requirements.yml          # collections: community.general, community.postgresql, ansible.posix
 ├── inventory/hosts.yml       # edit the 5 node IPs here
 ├── group_vars/all/
-│   ├── 01-vars.yml           # non-secret config (PG version, ports, network, tuning)
-│   └── vault.yml.example     # copy -> vault.yml, fill in, then ansible-vault encrypt
-├── site.yml                  # main build playbook
+│   └── 01-vars.yml           # non-secret config (PG version, ports, network, tuning)
+├── site.yml                  # main build playbook — prompts for all credentials/secrets
 ├── playbooks/cluster_health.yml
 └── roles/
     ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, PGDG repo
@@ -32,10 +31,10 @@ of every run — the play fails fast on any node that doesn't meet these:
 
 - **CPU**: 4 vCPUs (8+ recommended for DB nodes — warns, doesn't fail, if unmet)
 - **RAM**: 8 GB (16 GB+ recommended for DB nodes — warns, doesn't fail, if unmet)
-- **Disk**: 50 GB OS volume, **plus a separate data volume for DB nodes**
-  mounted under the PostgreSQL data directory (or a parent of it, e.g.
-  `/var/lib/postgresql`) — DB nodes fail the play if no such dedicated
-  volume is detected.
+- **Disk**: 50 GB OS volume. A separate data volume for DB nodes, mounted
+  under the PostgreSQL data directory (or a parent of it, e.g.
+  `/var/lib/postgresql`), is recommended but not required — DB nodes warn,
+  not fail, if the data directory shares a device with the OS volume.
 
 ## 1. Control VM setup
 
@@ -58,41 +57,54 @@ so nothing is hardcoded in `ansible.cfg`.
 1. **Inventory** — edit `inventory/hosts.yml` with your 5 real IPs. Hostnames
    (`pg-node-1`, `proxy-node-1`, ...) must match each machine's actual
    `hostname -s`, since Patroni/etcd/HAProxy configs key off that name.
-2. **Non-secret vars** — review `group_vars/all/01-vars.yml`: `vip_interface`
-   (confirm with `ip -4 addr show` on a proxy node), `vip_prefix`, PostgreSQL
-   version (defaults to 18 — override with `-e pg_version=16` at run time if
-   needed). `cluster_vip`/`app_network`/`ops_network` are no longer set here —
-   they're prompted for at run time (see below).
-3. **Secrets** —
-   ```bash
-   cp group_vars/all/vault.yml.example group_vars/all/vault.yml
-   vi group_vars/all/vault.yml        # set real passwords + alert_webhook_url
-   ansible-vault encrypt group_vars/all/vault.yml
-   ```
+2. **Non-secret vars** — review `group_vars/all/01-vars.yml`: `vip_prefix`,
+   PostgreSQL version (defaults to 18 — override with `-e pg_version=16` at
+   run time if needed). `cluster_vip`/`app_network`/`ops_network` are no
+   longer set here — they're prompted for at run time (see below).
+   `vip_interface` is auto-detected per proxy node from its default route;
+   only uncomment it in `group_vars/all/01-vars.yml` if you need to force a
+   specific NIC.
+3. **Secrets** — nothing to do here. There's no vault file: every
+   PostgreSQL / PgBouncer / HAProxy / keepalived credential and the alert
+   webhook URL is prompted for interactively when you run `site.yml` (see
+   below), so nothing is committed to this repo. Those values still end up
+   in plaintext in the rendered config files on the target nodes themselves
+   (`patroni.yml`, `userlist.txt`, `keepalived.conf`, ...) — that's inherent
+   to how each service consumes its credentials, not something this
+   playbook can avoid.
 
 ## 3. Run
 
 ```bash
-ansible-playbook site.yml --ask-vault-pass
+ansible-playbook site.yml
 ```
 
-`--ask-vault-pass` is the only flag needed — Ansible has to decrypt
-`group_vars/all/vault.yml` before it can parse the first play at all, so
-that password can't be collected any other way. Everything else — SSH
+No flags needed. `site.yml`'s first play prompts you, in order, for: SSH
 username, one password used for both SSH login and sudo/become, the cluster
-VIP (default `10.223.16.79`), and the `app_network`/`ops_network` CIDRs used
-for `pg_hba.conf`/PgBouncer/UFW rules (default `10.223.16.0/24`) — is
-prompted for interactively by `site.yml`'s own first play (press Enter on
-any prompt to keep its default), which then applies those values to all 5
-hosts for the rest of the run. To pass extra options through (e.g.
-`--limit`, `-e pg_version=16`), just append them:
-`ansible-playbook site.yml --ask-vault-pass --limit pg-node-1`.
+VIP (default `10.223.16.79`), the `app_network`/`ops_network` CIDRs used for
+`pg_hba.conf`/PgBouncer/UFW rules (default `10.223.16.0/24`), then the
+PostgreSQL replication/superuser/rewind/health-check accounts, the
+application database name/user, the PgBouncer admin account, the HAProxy
+stats account, the VRRP (keepalived) auth password, and finally the alert
+webhook URL. Press Enter on any prompt to keep its default (usernames and
+network CIDRs have one; passwords and the webhook URL don't — type a value
+or leave blank if you don't need it, e.g. no webhook). Those values are then
+applied to all 5 hosts for the rest of the run. To pass extra options
+through (e.g. `--limit`, `-e pg_version=16`), just append them:
+`ansible-playbook site.yml --limit pg-node-1`.
+
+Because nothing is persisted, you'll re-enter all of the above on every
+`site.yml` run — that's the trade-off of not using a vault file. To change a
+credential (e.g. `haproxy_stats_pass`), just type the new value next time
+you run `site.yml`; the affected role is idempotent and will update the
+config and restart only the affected service.
 
 Running `playbooks/cluster_health.yml` on its own (e.g. via
-`./run.sh playbooks/cluster_health.yml`) also prompts for the cluster VIP,
-since it never goes through `site.yml`'s credentials play. That prompt is
-automatically skipped when `cluster_health.yml` runs as the last step of the
-full `site.yml` build.
+`./run.sh playbooks/cluster_health.yml`) prompts for its own subset of the
+above (health-check credentials, HAProxy stats credentials, alert webhook
+URL, cluster VIP), since it never goes through `site.yml`'s credentials
+play. That prompt is automatically skipped when `cluster_health.yml` runs as
+the last step of the full `site.yml` build.
 
 If your nodes use SSH keys rather than password auth, leave the SSH
 password prompt blank when it appears — key-based auth will be used
@@ -184,9 +196,10 @@ for the weekly cron:
 sudo -u postgres /usr/local/lib/pgbackrest-scripts/restore_verify.sh
 ```
 
-**Alerts** go to `alert_webhook_url` (in `group_vars/all/vault.yml`, a
-Slack/Discord-style incoming webhook — treat it as a secret, anyone with the
-URL can post to your channel). `alert_webhook_payload_key` controls the JSON
+**Alerts** go to `alert_webhook_url` (prompted for interactively at run
+time — a Slack/Discord-style incoming webhook; treat it as a secret, anyone
+with the URL can post to your channel). `alert_webhook_payload_key` controls
+the JSON
 key used (`text` for Slack, `content` for Discord; Microsoft Teams needs a
 fuller adaptive-card payload and isn't supported by this simple webhook
 POST). Two independent alert paths:
@@ -200,17 +213,19 @@ POST). Two independent alert paths:
   problem even if the immediate cron-side alert never fired (e.g. the node
   couldn't reach the webhook URL at the time).
 
-To test the alert path end-to-end: point `alert_webhook_url` at a real test
-channel, then stop `etcd` on one node and rerun
-`./run.sh playbooks/cluster_health.yml` — a failure message should land in
-the channel.
+To test the alert path end-to-end: stop `etcd` on one node, then run
+`./run.sh playbooks/cluster_health.yml` and enter a real test channel's URL
+at the `alert_webhook_url` prompt — a failure message should land in the
+channel.
 
 ## Re-running / making changes
 
 Every role is idempotent — re-running `site.yml` after changing a variable
-(e.g. `haproxy_stats_pass`, `pgbouncer_pool_mode`) will update the relevant
-config file and restart only the affected service via its handler. Patroni
-config changes are POSTed to `/reload` rather than restarting PostgreSQL.
+(e.g. `pgbouncer_pool_mode` in `group_vars/all/01-vars.yml`, or a different
+value typed at a credential prompt such as `haproxy_stats_pass`) will update
+the relevant config file and restart only the affected service via its
+handler. Patroni config changes are POSTed to `/reload` rather than
+restarting PostgreSQL.
 
 **Caution:** the `etcd` role's own restart handler is intentionally
 disabled (see `roles/etcd/handlers/main.yml`) to avoid an accidental

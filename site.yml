@@ -3,14 +3,12 @@
 # site.yml — builds the whole PostgreSQL HA cluster from scratch, run from a
 # separate Ansible control VM.
 #
-#   ansible-playbook site.yml --ask-vault-pass
+#   ansible-playbook site.yml
 #
-# The only flag left is --ask-vault-pass: Ansible must decrypt
-# group_vars/all/vault.yml before it can even parse the first play, so that
-# password can't be collected via an in-playbook prompt — it has to be
-# supplied at invocation. Everything else (SSH username, and one password
-# used for both SSH login and sudo/become) is prompted for interactively by
-# the first play below.
+# No flags needed and nothing is stored on disk: every credential (SSH login,
+# PostgreSQL/PgBouncer/HAProxy/keepalived service accounts, the alert
+# webhook) is prompted for interactively by the first play below and applied
+# to every host for the rest of the run.
 #
 # Order matters:
 #   0. Collect connection credentials — prompts once, applies to every host
@@ -30,7 +28,7 @@
 #                     Patroni primary count is wrong or a service is down
 # =============================================================================
 
-- name: Collect connection credentials
+- name: Collect connection credentials and cluster secrets
   hosts: localhost
   connection: local
   gather_facts: false
@@ -53,8 +51,67 @@
       prompt: "Ops network CIDR (allowed to reach HAProxy stats)"
       private: false
       default: "10.223.16.0/24"
+    - name: repl_user
+      prompt: "PostgreSQL replication username"
+      private: false
+      default: "replicator"
+    - name: repl_password
+      prompt: "PostgreSQL replication password"
+      private: true
+    - name: patroni_super_user
+      prompt: "PostgreSQL superuser username"
+      private: false
+      default: "postgres"
+    - name: patroni_super_pass
+      prompt: "PostgreSQL superuser password"
+      private: true
+    - name: patroni_rewind_user
+      prompt: "pg_rewind username"
+      private: false
+      default: "rewind_user"
+    - name: patroni_rewind_pass
+      prompt: "pg_rewind password"
+      private: true
+    - name: health_user
+      prompt: "Health-check DB username"
+      private: false
+      default: "pgchecker"
+    - name: health_pass
+      prompt: "Health-check DB password"
+      private: true
+    - name: app_db
+      prompt: "Application database name"
+      private: false
+      default: "appdb"
+    - name: app_db_user
+      prompt: "Application database username"
+      private: false
+      default: "appuser"
+    - name: app_db_pass
+      prompt: "Application database password"
+      private: true
+    - name: pcp_user
+      prompt: "PgBouncer admin username"
+      private: false
+      default: "pgbounceradmin"
+    - name: pcp_pass
+      prompt: "PgBouncer admin password"
+      private: true
+    - name: haproxy_stats_user
+      prompt: "HAProxy stats username"
+      private: false
+      default: "haproxyadmin"
+    - name: haproxy_stats_pass
+      prompt: "HAProxy stats password"
+      private: true
+    - name: vrrp_auth_pass
+      prompt: "VRRP (keepalived) authentication password"
+      private: true
+    - name: alert_webhook_url
+      prompt: "Alert webhook URL (blank to disable alerts)"
+      private: false
   tasks:
-    - name: Apply SSH/become credentials and network CIDRs to every cluster host
+    - name: Apply credentials, secrets, and network settings to every cluster host
       ansible.builtin.add_host:
         name: "{{ item }}"
         ansible_user: "{{ ssh_user }}"
@@ -63,9 +120,32 @@
         cluster_vip: "{{ cluster_vip }}"
         app_network: "{{ app_network }}"
         ops_network: "{{ ops_network }}"
+        repl_user: "{{ repl_user }}"
+        repl_password: "{{ repl_password }}"
+        patroni_super_user: "{{ patroni_super_user }}"
+        patroni_super_pass: "{{ patroni_super_pass }}"
+        patroni_rewind_user: "{{ patroni_rewind_user }}"
+        patroni_rewind_pass: "{{ patroni_rewind_pass }}"
+        health_user: "{{ health_user }}"
+        health_pass: "{{ health_pass }}"
+        app_db: "{{ app_db }}"
+        app_db_user: "{{ app_db_user }}"
+        app_db_pass: "{{ app_db_pass }}"
+        pcp_user: "{{ pcp_user }}"
+        pcp_pass: "{{ pcp_pass }}"
+        haproxy_stats_user: "{{ haproxy_stats_user }}"
+        haproxy_stats_pass: "{{ haproxy_stats_pass }}"
+        vrrp_auth_pass: "{{ vrrp_auth_pass }}"
+        alert_webhook_url: "{{ alert_webhook_url }}"
       loop: "{{ groups['pg_ha_cluster'] }}"
       loop_control:
         label: "{{ item }}"
+      no_log: true
+
+    - name: Apply alert webhook URL to the control node (for cluster_health.yml's own alert task)
+      ansible.builtin.add_host:
+        name: localhost
+        alert_webhook_url: "{{ alert_webhook_url }}"
       no_log: true
 
 - name: OS preparation — every node

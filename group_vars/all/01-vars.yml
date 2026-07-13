@@ -1,27 +1,26 @@
 ---
 # =============================================================================
-# Global cluster variables — x86_64 only. Non-secret settings live here;
-# credentials live in group_vars/all/vault.yml (ansible-vault encrypted).
-# Copy vault.yml.example -> vault.yml, fill in real passwords, then:
-#   ansible-vault encrypt group_vars/all/vault.yml
+# Global cluster variables — x86_64 only. Non-secret settings live here.
+# Credentials (PostgreSQL/PgBouncer/HAProxy/keepalived accounts, the alert
+# webhook) are never committed to disk — they're prompted for interactively
+# by site.yml's "Collect connection credentials and cluster secrets" play
+# (and by playbooks/cluster_health.yml's own prompt when run standalone).
 # See README.md.
 # =============================================================================
 
 # ── Network ───────────────────────────────────────────────────────────────
-vip_interface: enp1s0          # confirm with: ip -4 addr show
+# vip_interface: enp1s0        # optional override — auto-detected from each
+                                # proxy node's default route if left unset
 vip_prefix:    24
 ntp_server:    pool.ntp.org
 
 # cluster_vip / app_network / ops_network are prompted for interactively
-# instead of living here — cluster_vip and the credentials prompt happen in
-# site.yml's "Collect connection credentials" play; playbooks/cluster_health.yml
-# has its own standalone prompt for cluster_vip (skipped automatically when
-# it runs as part of site.yml, since the value is already set by then).
+# instead of living here (see the header note above about credential prompts).
 
 # VRRP: true = unicast (cloud/VMware safe default), false = multicast
 keepalived_unicast: true
 vrrp_router_id:     51
-# vrrp_auth_pass lives in group_vars/all/vault.yml
+# vrrp_auth_pass is prompted for interactively — see the header note above.
 
 # ── Cluster identity ─────────────────────────────────────────────────────
 patroni_scope:     pg-ha-cluster
@@ -42,11 +41,6 @@ maintenance_work_mem: 256MB
 random_page_cost: "1.1"                     # NVMe/SSD default
 effective_io_concurrency: 200
 
-# ── Credentials ───────────────────────────────────────────────────────────
-# All password values (repl_password, patroni_super_pass, patroni_rewind_pass,
-# health_pass, app_db_pass, pcp_pass, haproxy_stats_pass) and their matching
-# usernames live in group_vars/all/vault.yml — see vault.yml.example.
-
 # ── Ports ─────────────────────────────────────────────────────────────────
 patroni_api_port:    8008
 etcd_client_port:    2379
@@ -66,8 +60,7 @@ pgbouncer_reserve_pool_size: 5
 # ── Backups / archiving / alerts ──────────────────────────────────────────
 # Global (not role defaults) because playbooks/cluster_health.yml can run
 # standalone, without the pgbackrest role ever having run in that process.
-# alert_webhook_url itself lives in group_vars/all/vault.yml (secret-ish —
-# whoever has the URL can post to your channel).
+# alert_webhook_url is prompted for interactively — see the header note above.
 alert_webhook_payload_key: text   # "text" for Slack, "content" for Discord
 
 # How stale the most recent successful backup is allowed to be before

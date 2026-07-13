@@ -53,7 +53,7 @@
     (detected_vcpus | int < db_recommended_cpu_vcpus or
      ansible_memtotal_mb | int < db_recommended_ram_mb)
 
-- name: Enforce a dedicated data volume on DB nodes
+- name: Check for a dedicated data volume on DB nodes (recommended, not required)
   when: inventory_hostname in groups['db_nodes']
   block:
     - name: Start from the OS root volume as the fallback data-directory mount
@@ -71,16 +71,16 @@
          pg_data_dir.startswith(item.mount.rstrip('/') + '/')) and
         item.mount | length > pg_data_mount.mount | length
 
-    - name: Assert the data directory is on a separate volume from the OS
-      ansible.builtin.assert:
-        that: pg_data_mount.device != root_mount.device
-        fail_msg: >-
-          {{ inventory_hostname }}: no dedicated data volume detected for
-          {{ pg_data_dir }} — it resolves to the same device
+    - name: Warn if the data directory shares a device with the OS volume
+      ansible.builtin.debug:
+        msg: >-
+          RECOMMENDATION: {{ inventory_hostname }}: no dedicated data volume
+          detected for {{ pg_data_dir }} — it resolves to the same device
           ({{ pg_data_mount.device }}) as the OS root volume ({{ root_mount.mount }}).
-          DB nodes require {{ pg_data_dir }} (or a parent directory, e.g.
-          /var/lib/postgresql) mounted on its own volume, separate from
-          the 50GB OS volume.
+          For production use, mount {{ pg_data_dir }} (or a parent directory,
+          e.g. /var/lib/postgresql) on its own volume, separate from the OS
+          disk, so backups/WAL growth can't fill the root filesystem.
+      when: pg_data_mount.device == root_mount.device
 
 - name: Update apt cache and upgrade packages
   ansible.builtin.apt:

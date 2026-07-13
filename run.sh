@@ -10,5 +10,4 @@ exec ansible-playbook "$playbook" \
   -u "$ssh_user" \
   --ask-pass \
   --ask-become-pass \
-  --ask-vault-pass \
   "$@"

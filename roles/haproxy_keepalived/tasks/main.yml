@@ -15,6 +15,10 @@
       - ipvsadm
     state: present
 
+- name: Auto-detect the VIP interface unless explicitly overridden
+  ansible.builtin.set_fact:
+    vip_interface: "{{ vip_interface | default(ansible_default_ipv4.interface) }}"
+
 - name: Verify the VIP interface exists on this host
   ansible.builtin.command: ip link show {{ vip_interface }}
   register: vip_iface_check

@@ -147,7 +147,7 @@
   ansible.builtin.debug:
     msg: "{{ inventory_hostname }} is Patroni role: {{ patroni_status.json.role }}"
 
-- name: Grant pg_rewind permissions and create the health-check role (leader only)
+- name: Grant pg_rewind permissions, create the health-check role, and create the app database (leader only)
   when: patroni_status.json.role in ['master', 'primary']
   block:
     - name: Grant pg_rewind support functions to the rewind user
@@ -171,5 +171,28 @@
         name: "{{ health_user }}"
         password: "{{ health_pass }}"
         role_attr_flags: LOGIN
+        state: present
+      failed_when: false
+
+    - name: Create the application database role if missing
+      community.postgresql.postgresql_user:
+        login_user: "{{ patroni_super_user }}"
+        login_password: "{{ patroni_super_pass }}"
+        login_host: 127.0.0.1
+        login_port: "{{ pg_port }}"
+        name: "{{ app_db_user }}"
+        password: "{{ app_db_pass }}"
+        role_attr_flags: LOGIN
+        state: present
+      failed_when: false
+
+    - name: Create the application database if missing
+      community.postgresql.postgresql_db:
+        login_user: "{{ patroni_super_user }}"
+        login_password: "{{ patroni_super_pass }}"
+        login_host: 127.0.0.1
+        login_port: "{{ pg_port }}"
+        name: "{{ app_db }}"
+        owner: "{{ app_db_user }}"
         state: present
       failed_when: false
