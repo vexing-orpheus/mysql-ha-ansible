@@ -8,6 +8,26 @@
 # used in CI/cron as a gate as well as an interactive report.
 # =============================================================================
 
+- name: Collect cluster VIP (standalone runs only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    # Skipped when this playbook runs as part of site.yml — its own
+    # credentials play already set cluster_vip on every host by this point.
+    - name: Prompt for cluster VIP
+      ansible.builtin.pause:
+        prompt: "Cluster VIP address (used to check which proxy node currently holds it)"
+      register: vip_prompt
+      when: hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined
+
+    - name: Apply cluster VIP to proxy nodes
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        cluster_vip: "{{ vip_prompt.user_input | default('10.223.16.79', true) }}"
+      loop: "{{ groups['proxy_nodes'] }}"
+      when: hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined
+
 - name: Patroni cluster status
   hosts: db_nodes
   become: false

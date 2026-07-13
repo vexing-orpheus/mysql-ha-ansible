@@ -8,12 +8,15 @@
 # =============================================================================
 
 # ── Network ───────────────────────────────────────────────────────────────
-cluster_vip:   10.223.16.79
 vip_interface: enp1s0          # confirm with: ip -4 addr show
 vip_prefix:    24
-app_network:   10.223.16.0/24
-ops_network:   10.223.16.0/24
 ntp_server:    pool.ntp.org
+
+# cluster_vip / app_network / ops_network are prompted for interactively
+# instead of living here — cluster_vip and the credentials prompt happen in
+# site.yml's "Collect connection credentials" play; playbooks/cluster_health.yml
+# has its own standalone prompt for cluster_vip (skipped automatically when
+# it runs as part of site.yml, since the value is already set by then).
 
 # VRRP: true = unicast (cloud/VMware safe default), false = multicast
 keepalived_unicast: true

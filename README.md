@@ -58,10 +58,11 @@ so nothing is hardcoded in `ansible.cfg`.
 1. **Inventory** — edit `inventory/hosts.yml` with your 5 real IPs. Hostnames
    (`pg-node-1`, `proxy-node-1`, ...) must match each machine's actual
    `hostname -s`, since Patroni/etcd/HAProxy configs key off that name.
-2. **Non-secret vars** — review `group_vars/all/01-vars.yml`: cluster VIP,
-   `vip_interface` (confirm with `ip -4 addr show` on a proxy node),
-   networks, PostgreSQL version (defaults to 18 — override with
-   `-e pg_version=16` at run time if needed).
+2. **Non-secret vars** — review `group_vars/all/01-vars.yml`: `vip_interface`
+   (confirm with `ip -4 addr show` on a proxy node), `vip_prefix`, PostgreSQL
+   version (defaults to 18 — override with `-e pg_version=16` at run time if
+   needed). `cluster_vip`/`app_network`/`ops_network` are no longer set here —
+   they're prompted for at run time (see below).
 3. **Secrets** —
    ```bash
    cp group_vars/all/vault.yml.example group_vars/all/vault.yml
@@ -77,12 +78,21 @@ ansible-playbook site.yml --ask-vault-pass
 
 `--ask-vault-pass` is the only flag needed — Ansible has to decrypt
 `group_vars/all/vault.yml` before it can parse the first play at all, so
-that password can't be collected any other way. Everything else (SSH
-username, and one password used for both SSH login and sudo/become) is
-prompted for interactively by `site.yml`'s own first play, which then
-applies those credentials to all 5 hosts for the rest of the run. To pass
-extra options through (e.g. `--limit`, `-e pg_version=16`), just append
-them: `ansible-playbook site.yml --ask-vault-pass --limit pg-node-1`.
+that password can't be collected any other way. Everything else — SSH
+username, one password used for both SSH login and sudo/become, the cluster
+VIP (default `10.223.16.79`), and the `app_network`/`ops_network` CIDRs used
+for `pg_hba.conf`/PgBouncer/UFW rules (default `10.223.16.0/24`) — is
+prompted for interactively by `site.yml`'s own first play (press Enter on
+any prompt to keep its default), which then applies those values to all 5
+hosts for the rest of the run. To pass extra options through (e.g.
+`--limit`, `-e pg_version=16`), just append them:
+`ansible-playbook site.yml --ask-vault-pass --limit pg-node-1`.
+
+Running `playbooks/cluster_health.yml` on its own (e.g. via
+`./run.sh playbooks/cluster_health.yml`) also prompts for the cluster VIP,
+since it never goes through `site.yml`'s credentials play. That prompt is
+automatically skipped when `cluster_health.yml` runs as the last step of the
+full `site.yml` build.
 
 If your nodes use SSH keys rather than password auth, leave the SSH
 password prompt blank when it appears — key-based auth will be used

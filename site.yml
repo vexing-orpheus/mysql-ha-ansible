@@ -41,13 +41,28 @@
     - name: ssh_pass
       prompt: "SSH / sudo password (blank to use SSH keys + passwordless sudo)"
       private: true
+    - name: cluster_vip
+      prompt: "Cluster VIP address (floats between proxy nodes via keepalived)"
+      private: false
+      default: "10.223.16.79"
+    - name: app_network
+      prompt: "App network CIDR (allowed to reach PgBouncer/HAProxy)"
+      private: false
+      default: "10.223.16.0/24"
+    - name: ops_network
+      prompt: "Ops network CIDR (allowed to reach HAProxy stats)"
+      private: false
+      default: "10.223.16.0/24"
   tasks:
-    - name: Apply SSH/become credentials to every cluster host
+    - name: Apply SSH/become credentials and network CIDRs to every cluster host
       ansible.builtin.add_host:
         name: "{{ item }}"
         ansible_user: "{{ ssh_user }}"
         ansible_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
         ansible_become_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
+        cluster_vip: "{{ cluster_vip }}"
+        app_network: "{{ app_network }}"
+        ops_network: "{{ ops_network }}"
       loop: "{{ groups['pg_ha_cluster'] }}"
       loop_control:
         label: "{{ item }}"
