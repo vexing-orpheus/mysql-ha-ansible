@@ -1,9 +1,4 @@
 ---
-- name: restart chrony
-  ansible.builtin.systemd:
-    name: chrony
-    state: restarted
-
 - name: apply sysctl
   ansible.builtin.command: sysctl --system
   changed_when: true

@@ -100,13 +100,19 @@
     owner: root
     group: root
     mode: "0644"
-  notify: restart chrony
 
-- name: Ensure chrony is enabled and running
+- name: Ensure chrony is enabled and running with our config
+  # Unconditional restart rather than notify/state:started — a host's
+  # chronyd may already be running (e.g. Ubuntu's default NTS bootstrap
+  # servers at first boot) from before Ansible ever wrote this file, in
+  # which case a plain "started" is a no-op and a file-diff-triggered
+  # handler never fires on a later idempotent run where the file already
+  # matches. Restarting every run guarantees chronyd is actually using our
+  # config before the sync-wait task below relies on it.
   ansible.builtin.systemd:
     name: chrony
     enabled: true
-    state: started
+    state: restarted
 
 - name: Wait for chrony to synchronize the system clock
   # Starting chrony doesn't wait for it to actually correct the clock — on a
