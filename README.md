@@ -49,8 +49,8 @@ ansible-galaxy collection install -r requirements.yml
 ```
 
 You'll need SSH + sudo access as a sudo-capable user on all 5 target nodes.
-`run.sh` (see below) prompts for the SSH username and password interactively,
-so nothing is hardcoded in `ansible.cfg`.
+Every playbook (see below) prompts for the SSH username and password
+interactively, so nothing is hardcoded in `ansible.cfg`.
 
 ## 2. Configure
 
@@ -100,19 +100,16 @@ you run `install.yml`; the affected role is idempotent and will update the
 config and restart only the affected service.
 
 Running `playbooks/cluster_health.yml` on its own (e.g. via
-`./run.sh playbooks/cluster_health.yml`) prompts for its own subset of the
-above (health-check credentials, HAProxy stats credentials, alert webhook
-URL, cluster VIP), since it never goes through `install.yml`'s credentials
-play. That prompt is automatically skipped when `cluster_health.yml` runs as
-the last step of the full `install.yml` build.
+`ansible-playbook playbooks/cluster_health.yml`) prompts for its own subset
+of the above (SSH username/password, health-check credentials, HAProxy
+stats credentials, alert webhook URL, cluster VIP), since it never goes
+through `install.yml`'s credentials play. That prompt is automatically
+skipped when `cluster_health.yml` runs as the last step of the full
+`install.yml` build.
 
 If your nodes use SSH keys rather than password auth, leave the SSH
 password prompt blank when it appears — key-based auth will be used
-automatically as long as `ssh_user` matches a key-authorized account.
-
-`run.sh` still works the old way (`./run.sh playbooks/cluster_health.yml`)
-for playbooks that don't have their own credential-prompt play, such as
-running `cluster_health.yml` standalone.
+automatically as long as the SSH username matches a key-authorized account.
 
 This runs, in order:
 
@@ -150,7 +147,7 @@ The health check above already runs automatically at the end of every
 whole build (e.g. from cron/CI), run it standalone:
 
 ```bash
-./run.sh playbooks/cluster_health.yml
+ansible-playbook playbooks/cluster_health.yml
 ```
 
 ## Backups, archiving & alerts
@@ -214,8 +211,8 @@ POST). Two independent alert paths:
   couldn't reach the webhook URL at the time).
 
 To test the alert path end-to-end: stop `etcd` on one node, then run
-`./run.sh playbooks/cluster_health.yml` and enter a real test channel's URL
-at the `alert_webhook_url` prompt — a failure message should land in the
+`ansible-playbook playbooks/cluster_health.yml` and enter a real test
+channel's URL at the `alert_webhook_url` prompt — a failure message should land in the
 channel.
 
 ## Re-running / making changes

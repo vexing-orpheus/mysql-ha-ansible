@@ -23,6 +23,20 @@
       ansible.builtin.set_fact:
         standalone_run: "{{ hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined }}"
 
+    - name: Prompt for SSH username
+      ansible.builtin.pause:
+        prompt: "SSH username"
+      register: p_ssh_user
+      when: standalone_run
+
+    - name: Prompt for SSH / sudo password
+      ansible.builtin.pause:
+        prompt: "SSH / sudo password (blank to use SSH keys + passwordless sudo)"
+        echo: false
+      register: p_ssh_pass
+      when: standalone_run
+      no_log: true
+
     - name: Prompt for health-check DB username
       ansible.builtin.pause:
         prompt: "Health-check DB username [pgchecker]"
@@ -62,6 +76,16 @@
         prompt: "Cluster VIP address (used to check which proxy node currently holds it)"
       register: p_cluster_vip
       when: standalone_run
+
+    - name: Apply SSH credentials to every cluster host
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        ansible_user: "{{ p_ssh_user.user_input }}"
+        ansible_password: "{{ p_ssh_pass.user_input if (p_ssh_pass.user_input | default('') | length > 0) else omit }}"
+        ansible_become_password: "{{ p_ssh_pass.user_input if (p_ssh_pass.user_input | default('') | length > 0) else omit }}"
+      loop: "{{ groups['pg_ha_cluster'] }}"
+      when: standalone_run
+      no_log: true
 
     - name: Apply health-check credentials to DB nodes
       ansible.builtin.add_host:

@@ -68,7 +68,7 @@
     - name: patroni_rewind_user
       prompt: "pg_rewind username"
       private: false
-      default: "rewind_user"
+      default: "rewinduser"
     - name: patroni_rewind_pass
       prompt: "pg_rewind password"
       private: true
@@ -121,21 +121,21 @@
         app_network: "{{ app_network }}"
         ops_network: "{{ ops_network }}"
         repl_user: "{{ repl_user }}"
-        repl_password: "{{ repl_password }}"
+        repl_password: "{{ repl_password | default('iforgottoaddapassword', true) }}"
         patroni_super_user: "{{ patroni_super_user }}"
-        patroni_super_pass: "{{ patroni_super_pass }}"
+        patroni_super_pass: "{{ patroni_super_pass | default('iforgottoaddapassword', true) }}"
         patroni_rewind_user: "{{ patroni_rewind_user }}"
-        patroni_rewind_pass: "{{ patroni_rewind_pass }}"
+        patroni_rewind_pass: "{{ patroni_rewind_pass | default('iforgottoaddapassword', true) }}"
         health_user: "{{ health_user }}"
-        health_pass: "{{ health_pass }}"
+        health_pass: "{{ health_pass | default('iforgottoaddapassword', true) }}"
         app_db: "{{ app_db }}"
         app_db_user: "{{ app_db_user }}"
-        app_db_pass: "{{ app_db_pass }}"
+        app_db_pass: "{{ app_db_pass | default('iforgottoaddapassword', true) }}"
         pcp_user: "{{ pcp_user }}"
-        pcp_pass: "{{ pcp_pass }}"
+        pcp_pass: "{{ pcp_pass | default('iforgottoaddapassword', true) }}"
         haproxy_stats_user: "{{ haproxy_stats_user }}"
-        haproxy_stats_pass: "{{ haproxy_stats_pass }}"
-        vrrp_auth_pass: "{{ vrrp_auth_pass }}"
+        haproxy_stats_pass: "{{ haproxy_stats_pass | default('iforgottoaddapassword', true) }}"
+        vrrp_auth_pass: "{{ vrrp_auth_pass | default('iforgottoaddapassword', true) }}"
         alert_webhook_url: "{{ alert_webhook_url }}"
       loop: "{{ groups['pg_ha_cluster'] }}"
       loop_control:
