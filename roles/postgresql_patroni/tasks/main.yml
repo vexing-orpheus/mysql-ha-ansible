@@ -38,12 +38,16 @@
   changed_when: false
   failed_when: false
 
+- name: Determine whether apt has an installable python3-patroni candidate
+  ansible.builtin.set_fact:
+    patroni_apt_available: "{{ 'Candidate:' in patroni_apt_policy.stdout and 'Candidate: (none)' not in patroni_apt_policy.stdout }}"
+
 - name: Install Patroni via apt when a suitable version is available
   ansible.builtin.apt:
     name: python3-patroni
     state: present
   register: patroni_apt_install
-  when: "'Candidate: (none)' not in patroni_apt_policy.stdout"
+  when: patroni_apt_available
 
 - name: Install Patroni via pip when apt package is unavailable
   ansible.builtin.pip:
@@ -52,7 +56,7 @@
       - psycopg2-binary
       - python-etcd
     extra_args: --break-system-packages
-  when: "'Candidate: (none)' in patroni_apt_policy.stdout"
+  when: not patroni_apt_available
 
 - name: Locate the patroni binary
   ansible.builtin.command: which patroni

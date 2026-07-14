@@ -88,6 +88,8 @@
   hosts: db_nodes
   become: false
   gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
   tasks:
     - name: Query Patroni REST API
       ansible.builtin.uri:
@@ -158,6 +160,8 @@
   hosts: db_nodes
   become: false
   gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
   tasks:
     - name: etcd endpoint health
       ansible.builtin.command: >
@@ -176,6 +180,8 @@
   hosts: proxy_nodes
   become: false
   gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
   tasks:
     - name: Check PgBouncer is listening
       ansible.builtin.wait_for:
@@ -238,6 +244,8 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
   tasks:
     - name: Count primaries and replicas
       ansible.builtin.set_fact:

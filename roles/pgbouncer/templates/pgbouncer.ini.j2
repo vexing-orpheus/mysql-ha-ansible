@@ -5,17 +5,9 @@
 ; =============================================================================
 
 [databases]
-{{ app_db }} = host=127.0.0.1 port={{ haproxy_write_port }} \
-    dbname={{ app_db }} \
-    pool_size={{ pgbouncer_default_pool_size }}
-
-{{ app_db }}_read = host=127.0.0.1 port={{ haproxy_read_port }} \
-    dbname={{ app_db }} \
-    pool_size={{ pgbouncer_default_pool_size }}
-
-postgres = host=127.0.0.1 port={{ haproxy_write_port }} \
-    dbname=postgres \
-    pool_size=5
+{{ app_db }} = host=127.0.0.1 port={{ haproxy_write_port }} dbname={{ app_db }} pool_size={{ pgbouncer_default_pool_size }}
+{{ app_db }}_read = host=127.0.0.1 port={{ haproxy_read_port }} dbname={{ app_db }} pool_size={{ pgbouncer_default_pool_size }}
+postgres = host=127.0.0.1 port={{ haproxy_write_port }} dbname=postgres pool_size=5
 
 [pgbouncer]
 listen_addr = *

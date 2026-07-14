@@ -63,6 +63,7 @@
     pgbackrest --stanza={{ patroni_scope }}
     {{ '' if (pgbackrest_patroni_status.json.role | default('')) in ['master', 'primary'] else '--no-online' }}
     stanza-create
+  become_user: postgres
   changed_when: false
 
 - name: Deploy backup/check/restore-verify cron jobs
