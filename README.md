@@ -13,7 +13,7 @@ pg-ha-ansible/
 ├── inventory/hosts.yml       # edit the 5 node IPs here
 ├── group_vars/all/
 │   └── 01-vars.yml           # non-secret config (PG version, ports, network, tuning)
-├── site.yml                  # main build playbook — prompts for all credentials/secrets
+├── install.yml                # main build playbook — prompts for all credentials/secrets
 ├── playbooks/cluster_health.yml
 └── roles/
     ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, PGDG repo
@@ -66,7 +66,7 @@ so nothing is hardcoded in `ansible.cfg`.
    specific NIC.
 3. **Secrets** — nothing to do here. There's no vault file: every
    PostgreSQL / PgBouncer / HAProxy / keepalived credential and the alert
-   webhook URL is prompted for interactively when you run `site.yml` (see
+   webhook URL is prompted for interactively when you run `install.yml` (see
    below), so nothing is committed to this repo. Those values still end up
    in plaintext in the rendered config files on the target nodes themselves
    (`patroni.yml`, `userlist.txt`, `keepalived.conf`, ...) — that's inherent
@@ -76,10 +76,10 @@ so nothing is hardcoded in `ansible.cfg`.
 ## 3. Run
 
 ```bash
-ansible-playbook site.yml
+ansible-playbook install.yml
 ```
 
-No flags needed. `site.yml`'s first play prompts you, in order, for: SSH
+No flags needed. `install.yml`'s first play prompts you, in order, for: SSH
 username, one password used for both SSH login and sudo/become, the cluster
 VIP (default `10.223.16.79`), the `app_network`/`ops_network` CIDRs used for
 `pg_hba.conf`/PgBouncer/UFW rules (default `10.223.16.0/24`), then the
@@ -91,20 +91,20 @@ network CIDRs have one; passwords and the webhook URL don't — type a value
 or leave blank if you don't need it, e.g. no webhook). Those values are then
 applied to all 5 hosts for the rest of the run. To pass extra options
 through (e.g. `--limit`, `-e pg_version=16`), just append them:
-`ansible-playbook site.yml --limit pg-node-1`.
+`ansible-playbook install.yml --limit pg-node-1`.
 
 Because nothing is persisted, you'll re-enter all of the above on every
-`site.yml` run — that's the trade-off of not using a vault file. To change a
+`install.yml` run — that's the trade-off of not using a vault file. To change a
 credential (e.g. `haproxy_stats_pass`), just type the new value next time
-you run `site.yml`; the affected role is idempotent and will update the
+you run `install.yml`; the affected role is idempotent and will update the
 config and restart only the affected service.
 
 Running `playbooks/cluster_health.yml` on its own (e.g. via
 `./run.sh playbooks/cluster_health.yml`) prompts for its own subset of the
 above (health-check credentials, HAProxy stats credentials, alert webhook
-URL, cluster VIP), since it never goes through `site.yml`'s credentials
+URL, cluster VIP), since it never goes through `install.yml`'s credentials
 play. That prompt is automatically skipped when `cluster_health.yml` runs as
-the last step of the full `site.yml` build.
+the last step of the full `install.yml` build.
 
 If your nodes use SSH keys rather than password auth, leave the SSH
 password prompt blank when it appears — key-based auth will be used
@@ -136,7 +136,7 @@ This runs, in order:
    status per proxy node, which node currently holds the VIP, and DB-node
    disk usage. Sends a consolidated alert to `alert_webhook_url` if
    anything is unhealthy, then exits non-zero if the primary-count
-   assertion fails, so `site.yml` itself fails the run if the cluster
+   assertion fails, so `install.yml` itself fails the run if the cluster
    comes up unhealthy.
 
 Each role waits on real state (etcd health, Patroni role, HAProxy stats
@@ -146,7 +146,7 @@ stops the play instead of silently continuing.
 ## 4. Verify (on demand)
 
 The health check above already runs automatically at the end of every
-`site.yml` build. To re-check cluster health later without re-running the
+`install.yml` build. To re-check cluster health later without re-running the
 whole build (e.g. from cron/CI), run it standalone:
 
 ```bash
@@ -159,7 +159,7 @@ Backups and WAL archiving are handled by pgBackRest (`roles/pgbackrest`),
 installed on all 3 DB nodes. `postgresql_patroni` sets `archive_mode`,
 `archive_command`, and `restore_command` in `patroni.yml` so archiving is
 wired up from the moment Postgres starts — there's a brief harmless window
-during a fresh `site.yml` run where WAL archive attempts fail because
+during a fresh `install.yml` run where WAL archive attempts fail because
 `pgbackrest` hasn't been installed yet (that happens in the very next play);
 it self-heals automatically once the `pgbackrest` play finishes, no restart
 needed.
@@ -220,7 +220,7 @@ channel.
 
 ## Re-running / making changes
 
-Every role is idempotent — re-running `site.yml` after changing a variable
+Every role is idempotent — re-running `install.yml` after changing a variable
 (e.g. `pgbouncer_pool_mode` in `group_vars/all/01-vars.yml`, or a different
 value typed at a credential prompt such as `haproxy_stats_pass`) will update
 the relevant config file and restart only the affected service via its
@@ -247,7 +247,7 @@ change etcd config.
   `group_vars/all/01-vars.yml` if you want fixed values.
 - **Firewall**: UFW rules are built from the inventory groups directly
   (`groups['db_nodes']`, `groups['proxy_nodes']`), so adding a node to the
-  inventory and re-running `site.yml` also updates firewall rules — no
+  inventory and re-running `install.yml` also updates firewall rules — no
   manual IP list maintenance.
 - This was converted from an existing dual-arch (x86_64 + s390x) bash
   script suite; s390x support was intentionally dropped per requirements.

@@ -12,12 +12,17 @@
   hosts: localhost
   connection: local
   gather_facts: false
-  vars:
-    # True only when this playbook runs on its own — site.yml's own
-    # credentials play already sets cluster_vip (and everything else below)
-    # on every host by the time this play would run as part of that import.
-    standalone_run: "{{ hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined }}"
   tasks:
+    - name: Determine whether this playbook is running standalone
+      # True only when this playbook runs on its own — install.yml's own
+      # credentials play already sets cluster_vip (and everything else below)
+      # on every host by the time this play would run as part of that import.
+      # Computed once into a fact (rather than a lazily re-evaluated play var)
+      # because a later task in this same play sets cluster_vip via add_host,
+      # which would otherwise flip this condition mid-play.
+      ansible.builtin.set_fact:
+        standalone_run: "{{ hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined }}"
+
     - name: Prompt for health-check DB username
       ansible.builtin.pause:
         prompt: "Health-check DB username [pgchecker]"
@@ -141,6 +146,8 @@
             age_hours=$(( (now - latest) / 3600 ))
             [ "${latest}" -gt 0 ] && [ "${age_hours}" -lt {{ pgbackrest_backup_freshness_hours }} ]
           register: backup_freshness_check
+          become: true
+          become_user: postgres
           changed_when: false
           failed_when: false
           args:

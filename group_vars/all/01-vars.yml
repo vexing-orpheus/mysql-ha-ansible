@@ -3,7 +3,7 @@
 # Global cluster variables — x86_64 only. Non-secret settings live here.
 # Credentials (PostgreSQL/PgBouncer/HAProxy/keepalived accounts, the alert
 # webhook) are never committed to disk — they're prompted for interactively
-# by site.yml's "Collect connection credentials and cluster secrets" play
+# by install.yml's "Collect connection credentials and cluster secrets" play
 # (and by playbooks/cluster_health.yml's own prompt when run standalone).
 # See README.md.
 # =============================================================================

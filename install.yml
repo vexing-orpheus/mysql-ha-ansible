@@ -1,9 +1,9 @@
 ---
 # =============================================================================
-# site.yml — builds the whole PostgreSQL HA cluster from scratch, run from a
+# install.yml — builds the whole PostgreSQL HA cluster from scratch, run from a
 # separate Ansible control VM.
 #
-#   ansible-playbook site.yml
+#   ansible-playbook install.yml
 #
 # No flags needed and nothing is stored on disk: every credential (SSH login,
 # PostgreSQL/PgBouncer/HAProxy/keepalived service accounts, the alert

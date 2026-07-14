@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-playbook="${1:-site.yml}"
+playbook="${1:-install.yml}"
 shift || true
 
 read -rp "SSH username: " ssh_user

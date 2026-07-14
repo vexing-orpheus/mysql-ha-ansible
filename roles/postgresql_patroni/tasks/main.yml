@@ -5,7 +5,7 @@
 # Patroni handles primary-election itself via etcd: whichever node's Patroni
 # starts first initializes the cluster, and the others detect the existing
 # leader key and clone as replicas automatically. To make that deterministic
-# rather than a race, invoke this role's play with `serial: 1` in site.yml so
+# rather than a race, invoke this role's play with `serial: 1` in install.yml so
 # pg-node-1 always starts (and becomes primary) before pg-node-2/3 start.
 # =============================================================================
 
