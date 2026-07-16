@@ -252,3 +252,187 @@ change etcd config.
   `01_bootstrap_all_nodes.sh` / `03_install_postgresql_patroni.sh` show
   what arch-conditional logic would need to be reintroduced (huge page
   size, `random_page_cost`, I/O scheduler, VRRP unicast default).
+
+## Restoring from a backup
+
+There's no playbook for this — restoring into production is manual, since it
+involves stopping Patroni cluster-wide and reasoning about etcd/timeline
+state, which isn't safe to fully automate. The only restore-related
+automation is `roles/pgbackrest/templates/restore_verify.sh.j2`
+(`/usr/local/lib/pgbackrest-scripts/restore_verify.sh` on each node), and
+that only ever restores into a scratch directory to test that a backup is
+usable — it never touches real data (see "Backups, archiving & alerts"
+above).
+
+**Caveat:** the pgBackRest repo (backups *and* WAL archive) is local disk,
+per node. Because Patroni's primary floats across the 3 DB nodes, a node's
+backup/WAL chain only stays intact for the time span it was continuously
+primary. If a failover happened between the backup you need and your
+target time, that node's chain is broken past the failover point — check
+which node actually has the chain you need before starting:
+
+```bash
+# run on pg-node-1, pg-node-2, pg-node-3 — look for a backup set whose
+# timeline covers your target
+sudo -u postgres pgbackrest --stanza=pg-ha-cluster info
+```
+
+Steps below restore to a specific point in time on the node with the valid
+chain (call it `pg-node-1`); for a plain restore of the latest backup
+instead of PITR, drop `--type=time --target=...` from step 3.
+
+1. **Stop Patroni on all 3 DB nodes** so another node can't get promoted
+   while you're mid-restore:
+   ```bash
+   sudo systemctl stop patroni
+   ```
+2. **Clear the old cluster state from etcd.** A restore rewinds history, and
+   Patroni will otherwise refuse to start on a timeline it doesn't
+   recognize:
+   ```bash
+   etcdctl --endpoints=http://<any-db-node-ip>:<etcd_client_port> del /service/pg-ha-cluster --prefix
+   ```
+3. **On the node with the valid chain**, move the current data directory
+   aside and restore:
+   ```bash
+   sudo -u postgres mv /var/lib/postgresql/18/main /var/lib/postgresql/18/main.bak
+   sudo -u postgres mkdir -p /var/lib/postgresql/18/main
+   sudo -u postgres pgbackrest --stanza=pg-ha-cluster --pg1-path=/var/lib/postgresql/18/main \
+       --type=time --target="2026-07-15 14:30:00+00" --target-action=promote restore
+   sudo chmod 700 /var/lib/postgresql/18/main
+   ```
+   (`--target-action=promote` finishes recovery and opens for writes once
+   the target is reached; use `pause` instead if you want to inspect the
+   data before committing to it. Swap `/var/lib/postgresql/18/main` for
+   `pg_data_dir` and `18` for `pg_version` if you've overridden either.)
+4. **Start Patroni on that node only.** With no cluster key in etcd,
+   Patroni bootstraps using the restored data directory as the new primary:
+   ```bash
+   sudo systemctl start patroni
+   ```
+   Watch `journalctl -u patroni -f` and confirm it comes up as leader and
+   completes recovery at the target.
+5. **Start Patroni on the other two nodes.** They'll see a leader already
+   registered in etcd and re-clone themselves as replicas via
+   `pg_basebackup` (this cluster's `create_replica_methods` is
+   `basebackup`, not pgBackRest), wiping their own old data automatically:
+   ```bash
+   sudo systemctl start patroni
+   ```
+   If a node doesn't auto-reinit, force it:
+   `patronictl -c /etc/patroni/patroni.yml reinit pg-ha-cluster <node-name>`.
+6. **Verify**, then remove the `.bak` directory from step 3 once you're
+   confident the restored data is correct:
+   ```bash
+   ansible-playbook playbooks/cluster_health.yml
+   ```
+
+## Replacing a lost DB node (VM gone, disk dead, unrecoverable)
+
+This covers the case where a DB node's VM itself is gone — not just its
+data — and you need to bring in a fresh replacement, whether it was the
+primary or a replica.
+
+**If the dead node was the primary**, Patroni/etcd should have already
+auto-promoted one of the other two nodes within ~30-40s
+(`ttl: 30` + `loop_wait: 10` in `patroni.yml.j2`). This is normal automatic
+failover, not something you trigger by hand. **Confirm that happened before
+touching anything else:**
+```bash
+ansible-playbook playbooks/cluster_health.yml
+```
+You should see exactly one surviving node as `Leader`. Replication here is
+async (no `synchronous_mode` set), so a handful of the most recent
+transactions may not have made it to a replica — that's the normal HA
+trade-off, not a bug.
+
+What's left is a *membership* problem, not a data problem: you're down to
+2-node etcd/Patroni redundancy until the dead node is replaced.
+
+**Why you can't just run `ansible-playbook install.yml --limit pg-node-1`
+on its own** — two sharp edges in the current playbook:
+
+1. The `etcd` role always renders `initial-cluster-state: 'new'`
+   (`roles/etcd/templates/etcd.conf.yml.j2`) and statically bootstraps —
+   it has no "rejoin an existing cluster" mode. Pointing it at a fresh VM
+   while the other two nodes already have an established cluster does
+   **not** correctly join it. Worse, this fails silently: both the etcd
+   role's own health check and `cluster_health.yml`'s etcd check only query
+   `http://127.0.0.1:2379`, so a lone, self-bootstrapped etcd instance
+   reports itself "healthy" even though it's an orphaned island with zero
+   real quorum. Patroni can even start successfully on that node anyway,
+   because `patroni.yml`'s `etcd3.hosts` lists all 3 DB node IPs and can
+   reach the *real* cluster through the other two — so everything looks
+   green while the new node's local etcd is quietly useless.
+2. The credentials play at the top of `install.yml` runs on `hosts:
+   localhost` and hands out every service password via `add_host`. If
+   `localhost` isn't included in `--limit`, that whole play is skipped and
+   every role on the target node renders with missing/placeholder
+   passwords.
+
+**Step by step:**
+
+1. **Confirm the surviving 2 nodes are healthy first** (see above) — don't
+   start etcd surgery on a cluster that isn't already stable.
+
+2. **On a surviving node, find and remove the dead etcd member:**
+   ```bash
+   etcdctl --endpoints=http://127.0.0.1:2379 member list
+   etcdctl --endpoints=http://127.0.0.1:2379 member remove <old-member-id>
+   ```
+
+3. **Pre-register the replacement as a new member**, so the existing
+   cluster is expecting it before its etcd process ever starts (name must
+   match `{{ etcd_cluster_name }}-{{ inventory_hostname }}`, default
+   `etcd_cluster_name` is `pg-ha-etcd`):
+   ```bash
+   etcdctl --endpoints=http://127.0.0.1:2379 member add pg-ha-etcd-pg-node-1 \
+       --peer-urls=http://<pg-node-1-ip>:2380
+   ```
+
+4. **Provision the replacement VM.** Reuse the same hostname (`pg-node-1`)
+   and IP if at all possible — it matches what's already in
+   `inventory/hosts.yml` and what every other node's rendered config
+   points at. If the IP has to change, update
+   `inventory/hosts.yml` first and redo step 3 with the new IP.
+
+5. **Run the build against just that node (plus `localhost` for
+   credentials):**
+   ```bash
+   ansible-playbook install.yml --limit "localhost,pg-node-1"
+   ```
+   This will still render `initial-cluster-state: 'new'` and start etcd
+   wrong — that's expected, fix it next.
+
+6. **Fix etcd on the replacement node** so it actually joins as the member
+   you pre-registered in step 3, instead of running as an orphaned
+   single-node cluster:
+   ```bash
+   sudo systemctl stop etcd
+   sudo rm -rf /var/lib/etcd/*
+   sudo sed -i "s/initial-cluster-state: 'new'/initial-cluster-state: 'existing'/" /etc/etcd/etcd.conf.yml
+   sudo systemctl start etcd
+   etcdctl --endpoints=http://127.0.0.1:2379 member list
+   ```
+   Confirm all 3 members show up and `endpoint health` is green **from
+   each** node, not just the new one. Note that a future `install.yml` run
+   touching this node will re-render the config back to
+   `initial-cluster-state: 'new'` (the role doesn't know the difference) —
+   harmless once the node has already joined and has cluster state on
+   disk, since etcd ignores `initial-cluster-state` after the first
+   successful start, but worth knowing if you're troubleshooting later.
+
+7. **Restart Patroni on the replacement node** to make sure it's cloning
+   against the now-correctly-joined local etcd rather than whatever it
+   improvised during step 5:
+   ```bash
+   sudo systemctl restart patroni
+   ```
+   Watch `journalctl -u patroni -f` — it should detect the existing leader
+   and clone as a replica via `pg_basebackup`.
+
+8. **Verify the cluster is back to full strength:**
+   ```bash
+   ansible-playbook playbooks/cluster_health.yml
+   ```
+   Expect 1 primary, 2 replicas, all 3 etcd members healthy.
