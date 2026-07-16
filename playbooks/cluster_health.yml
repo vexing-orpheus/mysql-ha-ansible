@@ -23,66 +23,82 @@
       ansible.builtin.set_fact:
         standalone_run: "{{ hostvars[groups['proxy_nodes'][0]].cluster_vip is not defined }}"
 
+    # Each prompt below is skipped when its variable is already supplied via
+    # -e (e.g. -e alert_webhook_url=... from cron), so this playbook can run
+    # fully non-interactively once every needed var is passed that way.
     - name: Prompt for SSH username
       ansible.builtin.pause:
         prompt: "SSH username"
       register: p_ssh_user
-      when: standalone_run
+      when: standalone_run and ssh_user is not defined
 
     - name: Prompt for SSH / sudo password
       ansible.builtin.pause:
         prompt: "SSH / sudo password (blank to use SSH keys + passwordless sudo)"
         echo: false
       register: p_ssh_pass
-      when: standalone_run
+      when: standalone_run and ssh_pass is not defined
       no_log: true
 
     - name: Prompt for health-check DB username
       ansible.builtin.pause:
         prompt: "Health-check DB username [pgchecker]"
       register: p_health_user
-      when: standalone_run
+      when: standalone_run and health_user is not defined
 
     - name: Prompt for health-check DB password
       ansible.builtin.pause:
         prompt: "Health-check DB password"
         echo: false
       register: p_health_pass
-      when: standalone_run
+      when: standalone_run and health_pass is not defined
       no_log: true
 
     - name: Prompt for HAProxy stats username
       ansible.builtin.pause:
         prompt: "HAProxy stats username [haproxyadmin]"
       register: p_haproxy_stats_user
-      when: standalone_run
+      when: standalone_run and haproxy_stats_user is not defined
 
     - name: Prompt for HAProxy stats password
       ansible.builtin.pause:
         prompt: "HAProxy stats password"
         echo: false
       register: p_haproxy_stats_pass
-      when: standalone_run
+      when: standalone_run and haproxy_stats_pass is not defined
       no_log: true
 
     - name: Prompt for alert webhook URL
       ansible.builtin.pause:
         prompt: "Alert webhook URL (blank to disable alerts)"
       register: p_alert_webhook_url
-      when: standalone_run
+      when: standalone_run and alert_webhook_url is not defined
 
     - name: Prompt for cluster VIP
       ansible.builtin.pause:
         prompt: "Cluster VIP address (used to check which proxy node currently holds it)"
       register: p_cluster_vip
+      when: standalone_run and cluster_vip is not defined
+
+    - name: Resolve effective values (-e extra-vars win over interactive prompts)
+      ansible.builtin.set_fact:
+        resolved_ssh_user: "{{ ssh_user | default(p_ssh_user.user_input | default('', true)) }}"
+        resolved_ssh_pass: "{{ ssh_pass | default(p_ssh_pass.user_input | default('', true)) }}"
+        resolved_health_user: "{{ health_user | default(p_health_user.user_input | default('pgchecker', true)) }}"
+        resolved_health_pass: "{{ health_pass | default(p_health_pass.user_input | default('', true)) }}"
+        resolved_haproxy_stats_user: "{{ haproxy_stats_user | default(p_haproxy_stats_user.user_input | default('haproxyadmin', true)) }}"
+        resolved_haproxy_stats_pass: "{{ haproxy_stats_pass | default(p_haproxy_stats_pass.user_input | default('', true)) }}"
+        resolved_alert_webhook_url: "{{ alert_webhook_url | default(p_alert_webhook_url.user_input | default('', true)) }}"
+        resolved_cluster_vip: "{{ cluster_vip | default(p_cluster_vip.user_input | default('10.223.16.79', true)) }}"
       when: standalone_run
+      no_log: true
 
     - name: Apply SSH credentials to every cluster host
       ansible.builtin.add_host:
         name: "{{ item }}"
-        ansible_user: "{{ p_ssh_user.user_input }}"
-        ansible_password: "{{ p_ssh_pass.user_input if (p_ssh_pass.user_input | default('') | length > 0) else omit }}"
-        ansible_become_password: "{{ p_ssh_pass.user_input if (p_ssh_pass.user_input | default('') | length > 0) else omit }}"
+        ansible_user: "{{ resolved_ssh_user }}"
+        ansible_password: "{{ resolved_ssh_pass if (resolved_ssh_pass | length > 0) else omit }}"
+        ansible_become_password: "{{ resolved_ssh_pass if (resolved_ssh_pass | length > 0) else omit }}"
       loop: "{{ groups['pg_ha_cluster'] }}"
       when: standalone_run
       no_log: true
@@ -90,8 +106,8 @@
     - name: Apply health-check credentials to DB nodes
       ansible.builtin.add_host:
         name: "{{ item }}"
-        health_user: "{{ p_health_user.user_input | default('pgchecker', true) }}"
-        health_pass: "{{ p_health_pass.user_input | default('', true) }}"
+        health_user: "{{ resolved_health_user }}"
+        health_pass: "{{ resolved_health_pass }}"
       loop: "{{ groups['db_nodes'] }}"
       when: standalone_run
       no_log: true
@@ -99,9 +115,9 @@
     - name: Apply HAProxy stats credentials and VIP to proxy nodes
       ansible.builtin.add_host:
         name: "{{ item }}"
-        haproxy_stats_user: "{{ p_haproxy_stats_user.user_input | default('haproxyadmin', true) }}"
-        haproxy_stats_pass: "{{ p_haproxy_stats_pass.user_input | default('', true) }}"
-        cluster_vip: "{{ p_cluster_vip.user_input | default('10.223.16.79', true) }}"
+        haproxy_stats_user: "{{ resolved_haproxy_stats_user }}"
+        haproxy_stats_pass: "{{ resolved_haproxy_stats_pass }}"
+        cluster_vip: "{{ resolved_cluster_vip }}"
       loop: "{{ groups['proxy_nodes'] }}"
       when: standalone_run
       no_log: true
@@ -109,7 +125,7 @@
     - name: Apply alert webhook URL to the control node
       ansible.builtin.add_host:
         name: localhost
-        alert_webhook_url: "{{ p_alert_webhook_url.user_input | default('', true) }}"
+        alert_webhook_url: "{{ resolved_alert_webhook_url }}"
       when: standalone_run
       no_log: true
 

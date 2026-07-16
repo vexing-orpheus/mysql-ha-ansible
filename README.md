@@ -231,6 +231,46 @@ To test the alert path end-to-end: stop `etcd` on one node, then run
 channel's URL at the `alert_webhook_url` prompt — a failure message should land in the
 channel.
 
+**Enabling alerting after the fact** (e.g. you left the webhook prompt blank
+on your initial `install.yml` run): since nothing is persisted, just re-run
+the build and actually enter a URL at the prompt this time:
+```bash
+ansible-playbook install.yml
+```
+Every other prompt (SSH creds, DB passwords, etc.) can be re-entered
+unchanged — every role is idempotent, so nothing gets rebuilt or restarted
+except what actually changed. To avoid touching the proxy nodes at all,
+scope it down instead (`localhost` must stay in the limit — it's the play
+that prompts for and distributes every credential; without it the DB nodes
+get no updated values):
+```bash
+ansible-playbook install.yml --limit "localhost,db_nodes"
+```
+This updates `/usr/local/lib/pgbackrest-scripts/alert.sh` on each DB node,
+so the pgBackRest cron alerts (`backup.sh`/`check.sh`/`restore_verify.sh`
+failures) work from then on with no further action needed — that part is
+persisted as a rendered file, unlike the credentials themselves.
+
+**Running `cluster_health.yml` non-interactively (cron/CI)**: run standalone,
+this playbook normally prompts for SSH creds, health-check/HAProxy-stats
+creds, the alert webhook URL, and the cluster VIP — fine interactively, but
+it'll hang forever with no TTY. Every one of those prompts is skipped if its
+variable is already supplied via `-e`, so a fully non-interactive run looks
+like:
+```bash
+ansible-playbook playbooks/cluster_health.yml \
+  -e ssh_user=deploy -e ssh_pass='' \
+  -e health_user=pgchecker -e health_pass='...' \
+  -e haproxy_stats_user=haproxyadmin -e haproxy_stats_pass='...' \
+  -e alert_webhook_url='https://hooks.slack.com/services/...' \
+  -e cluster_vip=10.223.16.79
+```
+(`ssh_pass=''` means "use SSH keys + passwordless sudo", same as leaving
+that prompt blank interactively.) Put the real values in a proper secrets
+store for your scheduler (e.g. an Ansible Vault–encrypted `-e @secrets.yml`,
+or your cron user's environment) rather than a plaintext crontab line —
+`-e` values show up in `ps` output and shell history otherwise.
+
 ## Re-running / making changes
 
 Every role is idempotent — re-running `install.yml` after changing a variable
