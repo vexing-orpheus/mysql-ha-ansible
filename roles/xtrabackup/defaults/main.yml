@@ -1,0 +1,39 @@
+---
+# xtrabackup_repo_path lives in group_vars/all/01-vars.yml, not here — see
+# the note near xtrabackup_backup_freshness_hours there.
+xtrabackup_log_path:    /var/log/xtrabackup
+xtrabackup_scripts_dir: /usr/local/lib/xtrabackup-scripts
+
+# Retention — full backup sets kept (each full-* dir plus the diff-* dirs
+# taken against it).
+xtrabackup_retention_full: 4
+
+# Cron schedules (minute hour dom month dow). Defaults: full backup Sunday
+# 01:00, diff backup daily (except Sunday) 01:00, integrity check daily
+# 05:00, full restore-verify weekly Sunday 03:00.
+xtrabackup_full_backup_cron:
+  minute: "0"
+  hour: "1"
+  weekday: "0"
+xtrabackup_diff_backup_cron:
+  minute: "0"
+  hour: "1"
+  weekday: "1-6"
+xtrabackup_check_cron:
+  minute: "0"
+  hour: "5"
+xtrabackup_restore_verify_cron:
+  minute: "0"
+  hour: "3"
+  weekday: "0"
+
+# Scratch location/port used by the weekly restore-verify test — never
+# touches the real data directory or port.
+xtrabackup_restore_verify_path: /var/lib/xtrabackup_restore_test
+xtrabackup_restore_verify_port: 5555
+
+# xtrabackup_backup_freshness_hours, xtrabackup_backup_node, and
+# alert_webhook_payload_key live in group_vars/all/01-vars.yml, not here —
+# playbooks/cluster_health.yml can be run standalone (without this role ever
+# having run in that process), so anything it needs must be globally defined
+# rather than a role default.

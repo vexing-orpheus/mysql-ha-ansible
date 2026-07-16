@@ -1,31 +1,29 @@
 ---
 # =============================================================================
-# install.yml — builds the whole PostgreSQL HA cluster from scratch, run from a
+# install.yml — builds the whole MySQL HA cluster from scratch, run from a
 # separate Ansible control VM.
 #
 #   ansible-playbook install.yml
 #
 # No flags needed and nothing is stored on disk: every credential (SSH login,
-# PostgreSQL/PgBouncer/HAProxy/keepalived service accounts, the alert
-# webhook) is prompted for interactively by the first play below and applied
-# to every host for the rest of the run.
+# MySQL root/SST/health/app accounts, HAProxy stats, keepalived VRRP, the
+# alert webhook) is prompted for interactively by the first play below and
+# applied to every host for the rest of the run.
 #
 # Order matters:
 #   0. Collect connection credentials — prompts once, applies to every host
 #   1. common       — OS prep on every node (parallel)
-#   2. etcd         — 3-node etcd cluster on db_nodes (parallel, static bootstrap)
-#   3. postgresql_patroni — one DB node at a time (serial: 1) so pg-node-1
-#                     deterministically becomes primary before the others
-#                     start and clone as replicas
-#   4. pgbackrest   — WAL archiving, backup/check/restore-verify cron on
-#                     db_nodes (parallel). archive_command was already set
-#                     in step 3's patroni.yml, so there's a brief harmless
-#                     window between Patroni starting and this step
-#                     installing pgbackrest where WAL archiving attempts
-#                     fail — it self-heals as soon as this step finishes.
-#   5. pgbouncer + haproxy_keepalived — both proxy nodes (parallel)
-#   6. cluster_health — read-only post-build gate; fails the run if the
-#                     Patroni primary count is wrong or a service is down
+#   2. mysql_galera — Percona XtraDB Cluster (Galera) on db_nodes, one at a
+#                     time (serial: 1) so db-node-1 deterministically
+#                     bootstraps a brand-new cluster before the others start
+#                     and join via IST/SST. Galera has its own built-in
+#                     quorum/group communication, so no separate DCS play is
+#                     needed.
+#   3. xtrabackup   — full/diff backups, integrity check, restore-verify cron
+#                     on a single fixed DB node (db_nodes)
+#   4. haproxy_keepalived — read/write routing + VIP failover (proxy_nodes)
+#   5. cluster_health — read-only post-build gate; fails the run if wsrep
+#                     state is wrong or a service is down
 # =============================================================================
 
 - name: Collect connection credentials and cluster secrets
@@ -44,40 +42,29 @@
       private: false
       default: "10.223.16.79"
     - name: app_network
-      prompt: "App network CIDR (allowed to reach PgBouncer/HAProxy)"
+      prompt: "App network CIDR (allowed to reach HAProxy)"
       private: false
       default: "10.223.16.0/24"
     - name: ops_network
       prompt: "Ops network CIDR (allowed to reach HAProxy stats)"
       private: false
       default: "10.223.16.0/24"
-    - name: repl_user
-      prompt: "PostgreSQL replication username"
-      private: false
-      default: "replicator"
-    - name: repl_password
-      prompt: "PostgreSQL replication password"
+    - name: mysql_root_pass
+      prompt: "MySQL root password"
       private: true
-    - name: patroni_super_user
-      prompt: "PostgreSQL superuser username"
+    - name: sst_user
+      prompt: "Galera SST username (used internally between DB nodes)"
       private: false
-      default: "postgres"
-    - name: patroni_super_pass
-      prompt: "PostgreSQL superuser password"
-      private: true
-    - name: patroni_rewind_user
-      prompt: "pg_rewind username"
-      private: false
-      default: "rewinduser"
-    - name: patroni_rewind_pass
-      prompt: "pg_rewind password"
+      default: "sstuser"
+    - name: sst_password
+      prompt: "Galera SST password"
       private: true
     - name: health_user
-      prompt: "Health-check DB username"
+      prompt: "Health-check (clustercheck) DB username"
       private: false
-      default: "pgchecker"
+      default: "clustercheck"
     - name: health_pass
-      prompt: "Health-check DB password"
+      prompt: "Health-check (clustercheck) DB password"
       private: true
     - name: app_db
       prompt: "Application database name"
@@ -89,13 +76,6 @@
       default: "appuser"
     - name: app_db_pass
       prompt: "Application database password"
-      private: true
-    - name: pcp_user
-      prompt: "PgBouncer admin username"
-      private: false
-      default: "pgbounceradmin"
-    - name: pcp_pass
-      prompt: "PgBouncer admin password"
       private: true
     - name: haproxy_stats_user
       prompt: "HAProxy stats username"
@@ -120,24 +100,19 @@
         cluster_vip: "{{ cluster_vip }}"
         app_network: "{{ app_network }}"
         ops_network: "{{ ops_network }}"
-        repl_user: "{{ repl_user }}"
-        repl_password: "{{ repl_password | default('iforgottoaddapassword', true) }}"
-        patroni_super_user: "{{ patroni_super_user }}"
-        patroni_super_pass: "{{ patroni_super_pass | default('iforgottoaddapassword', true) }}"
-        patroni_rewind_user: "{{ patroni_rewind_user }}"
-        patroni_rewind_pass: "{{ patroni_rewind_pass | default('iforgottoaddapassword', true) }}"
+        mysql_root_pass: "{{ mysql_root_pass | default('iforgottoaddapassword', true) }}"
+        sst_user: "{{ sst_user }}"
+        sst_password: "{{ sst_password | default('iforgottoaddapassword', true) }}"
         health_user: "{{ health_user }}"
         health_pass: "{{ health_pass | default('iforgottoaddapassword', true) }}"
         app_db: "{{ app_db }}"
         app_db_user: "{{ app_db_user }}"
         app_db_pass: "{{ app_db_pass | default('iforgottoaddapassword', true) }}"
-        pcp_user: "{{ pcp_user }}"
-        pcp_pass: "{{ pcp_pass | default('iforgottoaddapassword', true) }}"
         haproxy_stats_user: "{{ haproxy_stats_user }}"
         haproxy_stats_pass: "{{ haproxy_stats_pass | default('iforgottoaddapassword', true) }}"
         vrrp_auth_pass: "{{ vrrp_auth_pass | default('iforgottoaddapassword', true) }}"
         alert_webhook_url: "{{ alert_webhook_url }}"
-      loop: "{{ groups['pg_ha_cluster'] }}"
+      loop: "{{ groups['mysql_ha_cluster'] }}"
       loop_control:
         label: "{{ item }}"
       no_log: true
@@ -149,35 +124,28 @@
       no_log: true
 
 - name: OS preparation — every node
-  hosts: pg_ha_cluster
+  hosts: mysql_ha_cluster
   become: true
   roles:
     - common
 
-- name: etcd cluster — DB nodes
-  hosts: db_nodes
-  become: true
-  roles:
-    - etcd
-
-- name: PostgreSQL + Patroni — DB nodes (one at a time, pg-node-1 first)
+- name: Percona XtraDB Cluster (Galera) — DB nodes (one at a time, db-node-1 first)
   hosts: db_nodes
   become: true
   serial: 1
   roles:
-    - postgresql_patroni
+    - mysql_galera
 
-- name: Backups, WAL archiving, restore verification — DB nodes
+- name: Backups, integrity check, restore verification — DB nodes
   hosts: db_nodes
   become: true
   roles:
-    - pgbackrest
+    - xtrabackup
 
-- name: Connection pooling and load balancing — proxy nodes
+- name: Connection routing and load balancing — proxy nodes
   hosts: proxy_nodes
   become: true
   roles:
-    - pgbouncer
     - haproxy_keepalived
 
 - name: Post-build health check

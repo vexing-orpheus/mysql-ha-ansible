@@ -1,0 +1,57 @@
+# =============================================================================
+# Galera / Percona XtraDB Cluster configuration — managed by Ansible
+# (role: mysql_galera)
+# Node: {{ inventory_hostname }}
+# RAM: {{ ansible_memtotal_mb // 1024 }} GB  ->  innodb_buffer_pool_size={{ innodb_buffer_pool_size }},
+#                                        max_connections={{ mysql_max_connections_final }} (ceiling={{ mysql_max_connections }})
+# =============================================================================
+
+[mysqld]
+bind-address                    = 0.0.0.0
+port                             = {{ mysql_port }}
+datadir                          = {{ mysql_data_dir }}
+socket                           = {{ mysql_socket }}
+pid-file                         = /var/run/mysqld/mysqld.pid
+
+default_storage_engine           = InnoDB
+max_connections                   = {{ mysql_max_connections_final }}
+
+# ── InnoDB ──────────────────────────────────────────────────────────────
+innodb_buffer_pool_size          = {{ innodb_buffer_pool_size }}
+innodb_buffer_pool_instances     = {{ innodb_buffer_pool_instances }}
+innodb_log_file_size              = 1G
+innodb_flush_log_at_trx_commit    = 2
+innodb_flush_method                = O_DIRECT
+innodb_file_per_table               = 1
+innodb_autoinc_lock_mode             = 2
+innodb_doublewrite                    = 1
+
+# ── Binary log (point-in-time recovery alongside xtrabackup) ────────────
+log_bin                           = {{ mysql_log_dir }}/mysql-bin
+log_bin_index                      = {{ mysql_log_dir }}/mysql-bin.index
+binlog_format                       = ROW
+binlog_expire_logs_seconds           = 604800
+sync_binlog                           = 1
+
+# ── Logging ─────────────────────────────────────────────────────────────
+log_error                         = {{ mysql_log_dir }}/error.log
+slow_query_log                     = 1
+slow_query_log_file                 = {{ mysql_log_dir }}/slow.log
+long_query_time                      = 1
+
+# ── Galera / wsrep ──────────────────────────────────────────────────────
+wsrep_on                          = ON
+wsrep_provider                      = {{ wsrep_provider_path }}
+wsrep_cluster_name                   = {{ galera_cluster_name }}
+wsrep_cluster_address = gcomm://{% for host in groups['db_nodes'] %}{{ hostvars[host].ansible_host }}{% if not loop.last %},{% endif %}{% endfor %}
+
+wsrep_node_name                   = {{ inventory_hostname }}
+wsrep_node_address                 = {{ ansible_host }}
+
+wsrep_provider_options = "gcache.size={{ galera_gcache_size_mb }}M; gcs.fc_limit=128"
+wsrep_slave_threads                  = {{ ansible_processor_vcpus | default(ansible_processor_count) }}
+
+wsrep_sst_method                   = xtrabackup-v2
+wsrep_sst_auth                      = {{ sst_user }}:{{ sst_password }}
+
+pxc_strict_mode                      = ENFORCING

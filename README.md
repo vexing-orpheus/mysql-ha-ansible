@@ -1,26 +1,31 @@
-# PostgreSQL HA Cluster — Ansible
+# MySQL HA Cluster — Ansible
 
-Builds the same 5-node PostgreSQL + Patroni + etcd + PgBouncer + HAProxy/Keepalived
-cluster as the original bash scripts, but driven from a separate Ansible control
-VM, idempotently, with proper role separation. **x86_64 only.**
+Builds a 5-node Percona XtraDB Cluster (Galera) + HAProxy/Keepalived cluster,
+driven from a separate Ansible control VM, idempotently, with proper role
+separation. **x86_64 only.**
+
+Galera has its own built-in group communication/quorum, so there's no
+separate consensus-store role, and — per an explicit choice to keep the
+proxy layer simple — there's no MySQL-aware connection pooler (ProxySQL)
+either: HAProxy talks straight TCP to the cluster, health-checked via a
+small `clustercheck` endpoint on each DB node. See "Notes / things worth
+knowing" below for what that trades away.
 
 ## Layout
 
 ```
-pg-ha-ansible/
+mysql-ha-ansible/
 ├── ansible.cfg
-├── requirements.yml          # collections: community.general, community.postgresql, ansible.posix
+├── requirements.yml          # collections: community.general, community.mysql, ansible.posix
 ├── inventory/hosts.yml       # edit the 5 node IPs here
 ├── group_vars/all/
-│   └── 01-vars.yml           # non-secret config (PG version, ports, network, tuning)
+│   └── 01-vars.yml           # non-secret config (MySQL version, ports, network, tuning)
 ├── install.yml                # main build playbook — prompts for all credentials/secrets
 ├── playbooks/cluster_health.yml
 └── roles/
-    ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, PGDG repo
-    ├── etcd                 # 3-node etcd cluster (db_nodes)
-    ├── postgresql_patroni   # PostgreSQL + Patroni (db_nodes)
-    ├── pgbackrest           # WAL archiving, backup/check/restore-verify cron (db_nodes)
-    ├── pgbouncer            # connection pooler (proxy_nodes)
+    ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, Percona repo
+    ├── mysql_galera         # Percona XtraDB Cluster + Galera (db_nodes)
+    ├── xtrabackup           # backup/check/restore-verify cron (one fixed db_node)
     └── haproxy_keepalived   # read/write routing + VIP failover (proxy_nodes)
 ```
 
@@ -30,11 +35,15 @@ Minimum per node (DB or proxy), enforced by the `common` role at the start
 of every run — the play fails fast on any node that doesn't meet these:
 
 - **CPU**: 4 vCPUs (8+ recommended for DB nodes — warns, doesn't fail, if unmet)
-- **RAM**: 8 GB (16 GB+ recommended for DB nodes — warns, doesn't fail, if unmet)
+- **RAM**: 12 GB (16 GB+ recommended for DB nodes — warns, doesn't fail, if
+  unmet). Higher than a generic "8GB is enough for a database" floor because
+  InnoDB's buffer pool takes ~70% of RAM by default (`innodb_buffer_pool_pct`)
+  and Galera's gcache adds a further fixed ~1GB on top of that — see
+  "Memory-based tuning" below.
 - **Disk**: 50 GB OS volume. A separate data volume for DB nodes, mounted
-  under the PostgreSQL data directory (or a parent of it, e.g.
-  `/var/lib/postgresql`), is recommended but not required — DB nodes warn,
-  not fail, if the data directory shares a device with the OS volume.
+  under the MySQL data directory (or a parent of it, e.g. `/var/lib/mysql`),
+  is recommended but not required — DB nodes warn, not fail, if the data
+  directory shares a device with the OS volume.
 
 ## 1. Control VM setup
 
@@ -44,7 +53,7 @@ On a separate VM (not one of the 5 cluster nodes):
 sudo apt update && sudo apt install -y python3-pip
 pip3 install --break-system-packages ansible
 
-cd pg-ha-ansible
+cd mysql-ha-ansible
 ansible-galaxy collection install -r requirements.yml
 ```
 
@@ -55,23 +64,21 @@ interactively, so nothing is hardcoded in `ansible.cfg`.
 ## 2. Configure
 
 1. **Inventory** — edit `inventory/hosts.yml` with your 5 real IPs. Hostnames
-   (`pg-node-1`, `proxy-node-1`, ...) must match each machine's actual
-   `hostname -s`, since Patroni/etcd/HAProxy configs key off that name.
+   (`db-node-1`, `proxy-node-1`, ...) must match each machine's actual
+   `hostname -s`, since the Galera/HAProxy configs key off that name.
 2. **Non-secret vars** — review `group_vars/all/01-vars.yml`: `vip_prefix`,
-   PostgreSQL version (defaults to 18 — override with `-e pg_version=16` at
-   run time if needed). `cluster_vip`/`app_network`/`ops_network` are no
-   longer set here — they're prompted for at run time (see below).
-   `vip_interface` is auto-detected per proxy node from its default route;
-   only uncomment it in `group_vars/all/01-vars.yml` if you need to force a
-   specific NIC.
-3. **Secrets** — nothing to do here. There's no vault file: every
-   PostgreSQL / PgBouncer / HAProxy / keepalived credential and the alert
-   webhook URL is prompted for interactively when you run `install.yml` (see
-   below), so nothing is committed to this repo. Those values still end up
-   in plaintext in the rendered config files on the target nodes themselves
-   (`patroni.yml`, `userlist.txt`, `keepalived.conf`, ...) — that's inherent
-   to how each service consumes its credentials, not something this
-   playbook can avoid.
+   the Percona repo series (`percona_product_series`, defaults to `pxc80`).
+   `cluster_vip`/`app_network`/`ops_network` are no longer set here — they're
+   prompted for at run time (see below). `vip_interface` is auto-detected per
+   proxy node from its default route; only uncomment it in
+   `group_vars/all/01-vars.yml` if you need to force a specific NIC.
+3. **Secrets** — nothing to do here. There's no vault file: every MySQL /
+   HAProxy / keepalived credential and the alert webhook URL is prompted for
+   interactively when you run `install.yml` (see below), so nothing is
+   committed to this repo. Those values still end up in plaintext in the
+   rendered config files on the target nodes themselves (`galera.cnf`,
+   `/root/.my.cnf`, `keepalived.conf`, ...) — that's inherent to how each
+   service consumes its credentials, not something this playbook can avoid.
 
 ## 3. Run
 
@@ -82,20 +89,20 @@ ansible-playbook install.yml
 No flags needed. `install.yml`'s first play prompts you, in order, for: SSH
 username, one password used for both SSH login and sudo/become, the cluster
 VIP (default `10.223.16.79`), the `app_network`/`ops_network` CIDRs used for
-`pg_hba.conf`/PgBouncer/UFW rules (default `10.223.16.0/24`), then the
-PostgreSQL replication/superuser/rewind/health-check accounts, the
-application database name/user, the PgBouncer admin account, the HAProxy
-stats account, the VRRP (keepalived) auth password, and finally the alert
-webhook URL. Press Enter on any prompt to keep its default (usernames and
-network CIDRs have one; passwords and the webhook URL don't — type a value
-or leave blank if you don't need it, e.g. no webhook). Those values are then
-applied to all 5 hosts for the rest of the run. To pass extra options
-through (e.g. `--limit`, `-e pg_version=16`), just append them:
-`ansible-playbook install.yml --limit pg-node-1`.
+UFW rules (default `10.223.16.0/24`), then the MySQL root password, the
+Galera SST account (used internally between DB nodes for state transfer), the
+health-check (`clustercheck`) account, the application database name/user,
+the HAProxy stats account, the VRRP (keepalived) auth password, and finally
+the alert webhook URL. Press Enter on any prompt to keep its default
+(usernames and network CIDRs have one; passwords and the webhook URL don't —
+type a value or leave blank if you don't need it, e.g. no webhook). Those
+values are then applied to all 5 hosts for the rest of the run. To pass extra
+options through (e.g. `--limit`, `-e percona_product_series=pxc57`), just
+append them: `ansible-playbook install.yml --limit db-node-1`.
 
 Because nothing is persisted, you'll re-enter all of the above on every
-`install.yml` run — that's the trade-off of not using a vault file. To change a
-credential (e.g. `haproxy_stats_pass`), just type the new value next time
+`install.yml` run — that's the trade-off of not using a vault file. To change
+a credential (e.g. `haproxy_stats_pass`), just type the new value next time
 you run `install.yml`; the affected role is idempotent and will update the
 config and restart only the affected service.
 
@@ -113,32 +120,32 @@ automatically as long as the SSH username matches a key-authorized account.
 
 This runs, in order:
 
-1. **common** on all 5 nodes in parallel — OS prep, kernel tuning, UFW, PGDG repo.
-2. **etcd** on the 3 DB nodes in parallel — all three are configured with the
-   full member list up front (`initial-cluster-state: new`) and started
-   together, which is etcd's supported static-bootstrap pattern.
-3. **postgresql_patroni** on the 3 DB nodes **one at a time** (`serial: 1`,
-   in inventory order — pg-node-1 first). Patroni does its own leader
-   election via etcd: whichever instance starts first initializes the
-   cluster, and the others detect the existing leader key and clone as
-   replicas automatically. Running this play `serial: 1` just makes that
-   deterministic instead of a race.
-4. **pgbackrest** on the 3 DB nodes in parallel — WAL archiving, and cron
-   jobs for scheduled backups, an integrity check, and restore verification.
-   See "Backups, archiving & alerts" below.
-5. **pgbouncer** + **haproxy_keepalived** on both proxy nodes in parallel.
-6. **cluster_health** (imported from `playbooks/cluster_health.yml`) —
-   reports Patroni role per node (asserts exactly one primary), etcd
-   health, WAL archiver failures, backup freshness, PgBouncer/HAProxy
-   status per proxy node, which node currently holds the VIP, and DB-node
-   disk usage. Sends a consolidated alert to `alert_webhook_url` if
-   anything is unhealthy, then exits non-zero if the primary-count
-   assertion fails, so `install.yml` itself fails the run if the cluster
-   comes up unhealthy.
+1. **common** on all 5 nodes in parallel — OS prep, kernel tuning, UFW,
+   Percona repo.
+2. **mysql_galera** on the 3 DB nodes **one at a time** (`serial: 1`, in
+   inventory order — db-node-1 first). Galera has its own built-in group
+   communication/quorum: db-node-1 bootstraps a brand-new cluster only if no
+   peer already has one running (`systemctl start mysql@bootstrap.service`);
+   every other node — and db-node-1 itself on a re-run against an
+   already-live cluster — just starts normally and joins via IST/SST from
+   whichever peers are already up. Running this play `serial: 1` just makes
+   first-time bootstrap deterministic instead of a race.
+3. **xtrabackup** on the 3 DB nodes in parallel — cron jobs for scheduled
+   backups, an integrity check, and restore verification, all gated to run
+   on a single fixed node rather than chasing a floating primary (see
+   "Backups & alerts" below).
+4. **haproxy_keepalived** on both proxy nodes in parallel.
+5. **cluster_health** (imported from `playbooks/cluster_health.yml`) —
+   reports each node's wsrep state/cluster membership (asserts all 3 DB
+   nodes are in the Primary component), backup freshness, HAProxy status per
+   proxy node, which node currently holds the VIP, and DB-node disk usage.
+   Sends a consolidated alert to `alert_webhook_url` if anything is
+   unhealthy, then exits non-zero if the cluster-membership assertion fails,
+   so `install.yml` itself fails the run if the cluster comes up unhealthy.
 
-Each role waits on real state (etcd health, Patroni role, HAProxy stats
-page, PgBouncer's listening port) before moving on, so a partial failure
-stops the play instead of silently continuing.
+Each role waits on real state (wsrep sync state, the clustercheck endpoint,
+HAProxy's stats page) before moving on, so a partial failure stops the play
+instead of silently continuing.
 
 ## 4. Verify (on demand)
 
@@ -150,86 +157,81 @@ whole build (e.g. from cron/CI), run it standalone:
 ansible-playbook playbooks/cluster_health.yml
 ```
 
-## Backups, archiving & alerts
+## Backups & alerts
 
-Backups and WAL archiving are handled by pgBackRest (`roles/pgbackrest`),
-installed on all 3 DB nodes. `postgresql_patroni` sets `archive_mode`,
-`archive_command`, and `restore_command` in `patroni.yml` so archiving is
-wired up from the moment Postgres starts — there's a brief harmless window
-during a fresh `install.yml` run where WAL archive attempts fail because
-`pgbackrest` hasn't been installed yet (that happens in the very next play);
-it self-heals automatically once the `pgbackrest` play finishes, no restart
-needed.
+Backups are handled by Percona XtraBackup (`roles/xtrabackup`), which is
+already installed on all 3 DB nodes by `mysql_galera` (it's also what
+Galera's SST uses to clone a joining node). Every Galera node holds
+identical data, so backups here just run on **one fixed node**
+(`xtrabackup_backup_node` in
+`group_vars/all/01-vars.yml`, default `groups['db_nodes'][1]` — i.e.
+db-node-2, deliberately not the HAProxy-designated write node db-node-1).
+That keeps backup I/O off the node serving writes, and avoids maintaining 3
+independent, redundant backup chains of the same data.
 
-**Repo is local disk, per node** (`pgbackrest_repo_path`, default
-`/var/lib/pgbackrest`) — deliberately not S3/NFS. Because Patroni's primary
-floats across `pg-node-1/2/3`, a node's local backup chain only grows while
-it's primary. After a failover, the new primary has no local chain yet, so
-its next scheduled backup is automatically a full backup instead of an
-incremental/diff one — pgBackRest handles this on its own, it's just worth
-knowing you'll see an extra full backup after every failover. If you'd
-rather backups survive independently of which node is primary, point
-`pgbackrest_repo_path` at a shared mount or switch the role to an
-S3-compatible `repo1-type` — not done here to keep the setup dependency-free.
+**Repo is local disk** on that one node (`xtrabackup_repo_path`, default
+`/var/lib/xtrabackup`). If `xtrabackup_backup_node` ever changes (or that
+node is rebuilt from scratch), the next scheduled full backup starts a fresh
+chain there — nothing carries over automatically.
+
+**Point-in-time recovery**: binary logging is enabled (`log_bin` in
+`galera.cnf.j2`, `binlog_expire_logs_seconds` controls retention) so
+`mysqlbinlog` can replay transactions past the latest backup — see
+"Restoring from a backup" below for how the two combine.
 
 **Schedule** (all in `group_vars/all/01-vars.yml` /
-`roles/pgbackrest/defaults/main.yml`, overridable):
-- Full backup: weekly, Sunday 01:00. Diff backup: daily (except Sunday) 01:00.
-- Integrity check (`pgbackrest check` — WAL/manifest checksums, no restore): daily 05:00.
+`roles/xtrabackup/defaults/main.yml`, overridable):
+- Full backup: weekly, Sunday 01:00. Diff backup (against the latest full,
+  not chained): daily (except Sunday) 01:00.
+- Integrity check (verifies the latest backup completed and isn't stale):
+  daily 05:00.
 - Restore verification: weekly, Sunday 03:00.
 
-All of the above run via cron **on all 3 DB nodes**, but a wrapper script
-checks Patroni's role via its REST API first: backup/check exit immediately
-unless the node is currently the leader; restore-verify exits immediately
-*unless* it's a replica, so it never competes with the primary for I/O.
+All of the above run via cron **on `xtrabackup_backup_node` only** — no
+"am I the leader" wrapper is needed, since which node runs backups is a
+fixed Ansible variable, not runtime cluster state.
 
-**Retention** (`roles/pgbackrest/defaults/main.yml`, overridable):
-- `pgbackrest_retention_full: 4` — keeps the last 4 full backups.
-- `pgbackrest_retention_diff: 2` — keeps diff backups for the last 2 full-backup cycles.
+**Retention** (`roles/xtrabackup/defaults/main.yml`, overridable):
+- `xtrabackup_retention_full: 4` — keeps the last 4 full backup sets (each
+  full backup plus the diffs taken against it).
 
-With full backups weekly, that's roughly **4 weeks of backup history** on
-whichever node is taking backups, with daily diffs giving same-day recovery
-granularity within that window. Pruning happens automatically — `pgbackrest
-backup` runs `expire` after every successful backup, so old backups age out
-as new ones land. Because the repo is local per node (see above), pruning
-only happens on whichever node is *currently* primary: a former primary's
-old backup chain isn't actively pruned once it stops taking backups, since
-`backup.sh` only runs on the leader — it'll just sit on disk until that node
-becomes primary again. Override either value in `group_vars/all/01-vars.yml`
-if you want a longer/shorter window, e.g. `pgbackrest_retention_full: 8` for
-~2 months.
+With full backups weekly, that's roughly **4 weeks of backup history**, with
+daily diffs giving same-day recovery granularity within that window. Pruning
+happens automatically at the end of every full backup run
+(`backup.sh full`), deleting full/diff directories older than the oldest
+retained full. Override `xtrabackup_retention_full` in
+`group_vars/all/01-vars.yml` if you want a longer/shorter window, e.g. `8`
+for ~2 months.
 
 **Restore verification** actually proves a backup is usable, not just
-present: it restores the latest backup into a scratch directory
-(`pgbackrest_restore_verify_path`), boots a temporary Postgres instance on a
-throwaway port (`pgbackrest_restore_verify_port`, default 5555), runs a
-liveness query, then tears both down. To hand-trigger it instead of waiting
-for the weekly cron:
+present: it prepares and restores the latest full backup into a scratch
+directory (`xtrabackup_restore_verify_path`), boots a temporary standalone
+(non-Galera) `mysqld` on a throwaway port (`xtrabackup_restore_verify_port`,
+default 5555), runs a liveness query, then tears both down. To hand-trigger
+it instead of waiting for the weekly cron:
 ```bash
-sudo -u postgres /usr/local/lib/pgbackrest-scripts/restore_verify.sh
+sudo /usr/local/lib/xtrabackup-scripts/restore_verify.sh
 ```
 
 **Alerts** go to `alert_webhook_url` (prompted for interactively at run
 time — a Slack/Discord-style incoming webhook; treat it as a secret, anyone
 with the URL can post to your channel). `alert_webhook_payload_key` controls
-the JSON
-key used (`text` for Slack, `content` for Discord; Microsoft Teams needs a
-fuller adaptive-card payload and isn't supported by this simple webhook
-POST). Two independent alert paths:
+the JSON key used (`text` for Slack, `content` for Discord; Microsoft Teams
+needs a fuller adaptive-card payload and isn't supported by this simple
+webhook POST). Two independent alert paths:
 - Each cron script (`backup.sh`, `check.sh`, `restore_verify.sh`) posts
   immediately on its own failure, via the shared
-  `roles/pgbackrest/templates/alert.sh.j2` helper.
+  `roles/xtrabackup/templates/alert.sh.j2` helper.
 - `playbooks/cluster_health.yml`'s final play aggregates *everything* it
-  checked (Patroni roles, etcd, WAL archiver failures, backup freshness vs.
-  `pgbackrest_backup_freshness_hours`, PgBouncer/HAProxy) and posts one
-  consolidated message if anything is unhealthy — this is what catches a
-  problem even if the immediate cron-side alert never fired (e.g. the node
-  couldn't reach the webhook URL at the time).
+  checked (wsrep state/cluster membership, backup freshness, HAProxy) and
+  posts one consolidated message if anything is unhealthy — this is what
+  catches a problem even if the immediate cron-side alert never fired (e.g.
+  the node couldn't reach the webhook URL at the time).
 
-To test the alert path end-to-end: stop `etcd` on one node, then run
+To test the alert path end-to-end: stop `mysql` on one replica node, then run
 `ansible-playbook playbooks/cluster_health.yml` and enter a real test
-channel's URL at the `alert_webhook_url` prompt — a failure message should land in the
-channel.
+channel's URL at the `alert_webhook_url` prompt — a failure message should
+land in the channel.
 
 **Enabling alerting after the fact** (e.g. you left the webhook prompt blank
 on your initial `install.yml` run): since nothing is persisted, just re-run
@@ -246,8 +248,8 @@ get no updated values):
 ```bash
 ansible-playbook install.yml --limit "localhost,db_nodes"
 ```
-This updates `/usr/local/lib/pgbackrest-scripts/alert.sh` on each DB node,
-so the pgBackRest cron alerts (`backup.sh`/`check.sh`/`restore_verify.sh`
+This updates `/usr/local/lib/xtrabackup-scripts/alert.sh` on the designated
+backup node, so cron alerts (`backup.sh`/`check.sh`/`restore_verify.sh`
 failures) work from then on with no further action needed — that part is
 persisted as a rendered file, unlike the credentials themselves.
 
@@ -260,7 +262,7 @@ like:
 ```bash
 ansible-playbook playbooks/cluster_health.yml \
   -e ssh_user=deploy -e ssh_pass='' \
-  -e health_user=pgchecker -e health_pass='...' \
+  -e health_user=clustercheck -e health_pass='...' \
   -e haproxy_stats_user=haproxyadmin -e haproxy_stats_pass='...' \
   -e alert_webhook_url='https://hooks.slack.com/services/...' \
   -e cluster_vip=10.223.16.79
@@ -274,110 +276,129 @@ or your cron user's environment) rather than a plaintext crontab line —
 ## Re-running / making changes
 
 Every role is idempotent — re-running `install.yml` after changing a variable
-(e.g. `pgbouncer_pool_mode` in `group_vars/all/01-vars.yml`, or a different
-value typed at a credential prompt such as `haproxy_stats_pass`) will update
-the relevant config file and restart only the affected service via its
-handler. Patroni config changes are POSTed to `/reload` rather than
-restarting PostgreSQL.
+(e.g. `innodb_buffer_pool_pct` in `group_vars/all/01-vars.yml`, or a
+different value typed at a credential prompt such as `haproxy_stats_pass`)
+will update the relevant config file and restart only the affected service
+via its handler.
 
-**Caution:** the `etcd` role's own restart handler is intentionally
-disabled (see `roles/etcd/handlers/main.yml`) to avoid an accidental
-simultaneous restart of all 3 etcd members from a single play run, which
-would drop quorum. Restart etcd nodes manually, one at a time, if you
-change etcd config.
+**Caution:** `mysql_galera`'s restart handler restarts the full `mysql`
+service, not a graceful reload — safe here because that role's play always
+runs with `serial: 1` (see `install.yml`), so only one DB node is ever
+mid-restart at a time and the other two retain Galera quorum (2 of 3) while
+it rejoins via IST/SST. If you ever invoke this role outside `install.yml`
+without `serial: 1`, don't — a parallel restart across all 3 nodes would
+drop the cluster.
 
 ## Notes / things worth knowing
 
-- **PostgreSQL 18 default**: pinned via `pg_version: 18` in
-  `group_vars/all/01-vars.yml`. Ubuntu 26.04 ships PG18 in its main
-  archive, but this playbook installs from PGDG explicitly (added by the
-  `common` role) so the version is always pinned regardless of which
-  Ubuntu release you're on.
-- **Memory-based tuning** (`shared_buffers`, `effective_cache_size`, huge
-  pages count) is computed per-host from `ansible_memtotal_mb` at runtime,
-  matching the original scripts' auto-detection. Override with
-  `shared_buffers_override` / `effective_cache_size_override` in
-  `group_vars/all/01-vars.yml` if you want fixed values.
+- **No connection pooling/multiplexing.** By design, there's no ProxySQL (or
+  other MySQL-aware pooler) layer here — HAProxy is TCP-only, so every
+  client connection is a real backend MySQL connection, no pooling. Fine at
+  moderate connection counts; watch `Threads_connected` under high
+  concurrency and consider adding ProxySQL later if it becomes a bottleneck.
+- **Static write-node priority, not a dynamic election.** Galera has no
+  single elected leader. `haproxy.cfg` designates db-node-1 as the active
+  writer and lists db-node-2/3 as HAProxy `backup` servers (only used once
+  db-node-1 fails its `clustercheck`). HAProxy will automatically shift
+  writes back to db-node-1 the moment it's healthy again (`backup` server
+  semantics) — a brief, avoidable cutover after recovery, not a bug. If
+  you'd rather control fail-back manually, remove the `backup` keyword's
+  implicit preference by monitoring and cutting over deliberately instead of
+  trusting automatic re-promotion.
+- **All 3 nodes stay directly writable at the MySQL layer.** Nothing here
+  enforces `read_only` on db-node-2/3 — HAProxy is what funnels application
+  writes to one node. Concurrent direct writes to multiple nodes (bypassing
+  HAProxy) will replicate via Galera's certification-based replication, but
+  can cause certification-conflict rollbacks under contention. Don't let
+  application code connect directly to DB node IPs for writes.
+- **Percona repo series**: pinned via `percona_product_series: pxc80` in
+  `group_vars/all/01-vars.yml`. Override with `-e
+  percona_product_series=pxc57` at run time if you need a different major
+  version — the `common` role's `percona-release setup` step picks up
+  whatever series you pass.
+- **Memory-based tuning** (`innodb_buffer_pool_size`,
+  `innodb_buffer_pool_instances`) is computed per-host from
+  `ansible_memtotal_mb` at runtime. Override with
+  `innodb_buffer_pool_size_override` in `group_vars/all/01-vars.yml` if you
+  want a fixed value. `max_connections` is similarly RAM-aware: it scales
+  down from the `mysql_max_connections` ceiling (default 500) using whatever
+  RAM is left over after the buffer pool and Galera's gcache
+  (`roles/mysql_galera/defaults/main.yml`'s `mysql_conn_*` vars), so a
+  minimum-spec node doesn't advertise more connections than it can actually
+  back — e.g. ~400 on a 12GB node vs. the full 500 on a 16GB+ one. Override
+  with `mysql_max_connections_override` to pin a fixed value instead.
 - **Firewall**: UFW rules are built from the inventory groups directly
   (`groups['db_nodes']`, `groups['proxy_nodes']`), so adding a node to the
   inventory and re-running `install.yml` also updates firewall rules — no
   manual IP list maintenance.
-- This was converted from an existing dual-arch (x86_64 + s390x) bash
-  script suite; s390x support was intentionally dropped per requirements.
-  If you need it back, the etcd/PostgreSQL tuning branches in the original
-  `01_bootstrap_all_nodes.sh` / `03_install_postgresql_patroni.sh` show
-  what arch-conditional logic would need to be reintroduced (huge page
-  size, `random_page_cost`, I/O scheduler, VRRP unicast default).
 
 ## Restoring from a backup
 
 There's no playbook for this — restoring into production is manual, since it
-involves stopping Patroni cluster-wide and reasoning about etcd/timeline
-state, which isn't safe to fully automate. The only restore-related
-automation is `roles/pgbackrest/templates/restore_verify.sh.j2`
-(`/usr/local/lib/pgbackrest-scripts/restore_verify.sh` on each node), and
-that only ever restores into a scratch directory to test that a backup is
-usable — it never touches real data (see "Backups, archiving & alerts"
-above).
+involves stopping the cluster and reasoning about which backup chain and
+binlog position to restore from, which isn't safe to fully automate. The
+only restore-related automation is
+`roles/xtrabackup/templates/restore_verify.sh.j2`
+(`/usr/local/lib/xtrabackup-scripts/restore_verify.sh` on
+`xtrabackup_backup_node`), and that only ever restores into a scratch
+directory to test that a backup is usable — it never touches real data (see
+"Backups & alerts" above).
 
-**Caveat:** the pgBackRest repo (backups *and* WAL archive) is local disk,
-per node. Because Patroni's primary floats across the 3 DB nodes, a node's
-backup/WAL chain only stays intact for the time span it was continuously
-primary. If a failover happened between the backup you need and your
-target time, that node's chain is broken past the failover point — check
-which node actually has the chain you need before starting:
+**Caveat:** the xtrabackup repo lives on a single fixed node
+(`xtrabackup_backup_node`, default db-node-2). If that node is unrecoverable,
+your backup chain goes with it — the other two nodes have identical *live*
+data (that's what Galera guarantees) but no independent backup history of
+their own. Treat `xtrabackup_repo_path` as something worth shipping off-box
+periodically (e.g. `rsync` to another host) if you need backups to survive
+the loss of that specific node.
 
-```bash
-# run on pg-node-1, pg-node-2, pg-node-3 — look for a backup set whose
-# timeline covers your target
-sudo -u postgres pgbackrest --stanza=pg-ha-cluster info
-```
+Steps below restore to a specific point in time (call the target node
+`db-node-1`); for a plain restore of the latest backup instead of PITR, skip
+the `mysqlbinlog` replay step.
 
-Steps below restore to a specific point in time on the node with the valid
-chain (call it `pg-node-1`); for a plain restore of the latest backup
-instead of PITR, drop `--type=time --target=...` from step 3.
-
-1. **Stop Patroni on all 3 DB nodes** so another node can't get promoted
-   while you're mid-restore:
+1. **Stop MySQL on all 3 DB nodes** so the cluster doesn't try to
+   re-certify writes against a node mid-restore:
    ```bash
-   sudo systemctl stop patroni
+   sudo systemctl stop mysql
    ```
-2. **Clear the old cluster state from etcd.** A restore rewinds history, and
-   Patroni will otherwise refuse to start on a timeline it doesn't
-   recognize:
+2. **On the target node**, move the current data directory aside and
+   restore the latest full backup (plus its most recent diff, if any) from
+   `xtrabackup_backup_node`:
    ```bash
-   etcdctl --endpoints=http://<any-db-node-ip>:<etcd_client_port> del /service/pg-ha-cluster --prefix
+   sudo mv /var/lib/mysql /var/lib/mysql.bak
+   sudo mkdir -p /var/lib/mysql
+   # Copy (or rsync) the full-*/diff-* directories over from xtrabackup_backup_node first, then:
+   sudo xtrabackup --prepare --apply-log-only --target-dir=/path/to/full-YYYYmmdd_HHMMSS
+   sudo xtrabackup --prepare --target-dir=/path/to/full-YYYYmmdd_HHMMSS --incremental-dir=/path/to/diff-YYYYmmdd_HHMMSS
+   sudo xtrabackup --copy-back --target-dir=/path/to/full-YYYYmmdd_HHMMSS --datadir=/var/lib/mysql
+   sudo chown -R mysql:mysql /var/lib/mysql
    ```
-3. **On the node with the valid chain**, move the current data directory
-   aside and restore:
+3. **Optional point-in-time replay** past the backup, using binlogs copied
+   from `xtrabackup_backup_node`'s `{{ mysql_log_dir }}` (or wherever you
+   ship them):
    ```bash
-   sudo -u postgres mv /var/lib/postgresql/18/main /var/lib/postgresql/18/main.bak
-   sudo -u postgres mkdir -p /var/lib/postgresql/18/main
-   sudo -u postgres pgbackrest --stanza=pg-ha-cluster --pg1-path=/var/lib/postgresql/18/main \
-       --type=time --target="2026-07-15 14:30:00+00" --target-action=promote restore
-   sudo chmod 700 /var/lib/postgresql/18/main
+   sudo mysqlbinlog --start-position=<pos-from-xtrabackup_binlog_info> \
+       --stop-datetime="2026-07-15 14:30:00" mysql-bin.000123 \
+       | sudo mysql --defaults-extra-file=/root/.my.cnf
    ```
-   (`--target-action=promote` finishes recovery and opens for writes once
-   the target is reached; use `pause` instead if you want to inspect the
-   data before committing to it. Swap `/var/lib/postgresql/18/main` for
-   `pg_data_dir` and `18` for `pg_version` if you've overridden either.)
-4. **Start Patroni on that node only.** With no cluster key in etcd,
-   Patroni bootstraps using the restored data directory as the new primary:
+   (`xtrabackup_binlog_info` inside the prepared backup directory records
+   the exact binlog file/position the backup was taken at.)
+4. **Start MySQL on the restored node only**, *without* rejoining the
+   existing cluster's gcomm address yet — bootstrap it as a new
+   single-node cluster so the other two nodes clone from it, not the other
+   way around:
    ```bash
-   sudo systemctl start patroni
+   sudo systemctl start mysql@bootstrap.service
+   sudo systemctl enable mysql
    ```
-   Watch `journalctl -u patroni -f` and confirm it comes up as leader and
-   completes recovery at the target.
-5. **Start Patroni on the other two nodes.** They'll see a leader already
-   registered in etcd and re-clone themselves as replicas via
-   `pg_basebackup` (this cluster's `create_replica_methods` is
-   `basebackup`, not pgBackRest), wiping their own old data automatically:
+5. **Start MySQL on the other two nodes.** With `wsrep_cluster_address`
+   still pointing at all 3 DB node IPs (unchanged in `galera.cnf`), they'll
+   detect the running node and clone themselves via SST
+   (`wsrep_sst_method=xtrabackup-v2`), wiping their own data automatically:
    ```bash
-   sudo systemctl start patroni
+   sudo systemctl start mysql
    ```
-   If a node doesn't auto-reinit, force it:
-   `patronictl -c /etc/patroni/patroni.yml reinit pg-ha-cluster <node-name>`.
-6. **Verify**, then remove the `.bak` directory from step 3 once you're
+6. **Verify**, then remove the `.bak` directory from step 2 once you're
    confident the restored data is correct:
    ```bash
    ansible-playbook playbooks/cluster_health.yml
@@ -386,109 +407,49 @@ instead of PITR, drop `--type=time --target=...` from step 3.
 ## Replacing a lost DB node (VM gone, disk dead, unrecoverable)
 
 This covers the case where a DB node's VM itself is gone — not just its
-data — and you need to bring in a fresh replacement, whether it was the
-primary or a replica.
+data — and you need to bring in a fresh replacement.
 
-**If the dead node was the primary**, Patroni/etcd should have already
-auto-promoted one of the other two nodes within ~30-40s
-(`ttl: 30` + `loop_wait: 10` in `patroni.yml.j2`). This is normal automatic
-failover, not something you trigger by hand. **Confirm that happened before
-touching anything else:**
+This is mostly a non-event for Galera: there's no separate cluster
+membership bookkeeping to fix up, and any node's local data can be fully
+rebuilt from the surviving nodes via SST. The steps are the ordinary
+`install.yml` flow, not a special procedure.
+
+**If the dead node was carrying HAProxy's write traffic (db-node-1)**,
+HAProxy fails over to db-node-2/3 automatically (see "Notes" above on
+`backup` server ordering) as soon as `clustercheck` reports db-node-1 down —
+confirm that happened before touching anything else:
 ```bash
 ansible-playbook playbooks/cluster_health.yml
 ```
-You should see exactly one surviving node as `Leader`. Replication here is
-async (no `synchronous_mode` set), so a handful of the most recent
-transactions may not have made it to a replica — that's the normal HA
-trade-off, not a bug.
-
-What's left is a *membership* problem, not a data problem: you're down to
-2-node etcd/Patroni redundancy until the dead node is replaced.
-
-**Why you can't just run `ansible-playbook install.yml --limit pg-node-1`
-on its own** — two sharp edges in the current playbook:
-
-1. The `etcd` role always renders `initial-cluster-state: 'new'`
-   (`roles/etcd/templates/etcd.conf.yml.j2`) and statically bootstraps —
-   it has no "rejoin an existing cluster" mode. Pointing it at a fresh VM
-   while the other two nodes already have an established cluster does
-   **not** correctly join it. Worse, this fails silently: both the etcd
-   role's own health check and `cluster_health.yml`'s etcd check only query
-   `http://127.0.0.1:2379`, so a lone, self-bootstrapped etcd instance
-   reports itself "healthy" even though it's an orphaned island with zero
-   real quorum. Patroni can even start successfully on that node anyway,
-   because `patroni.yml`'s `etcd3.hosts` lists all 3 DB node IPs and can
-   reach the *real* cluster through the other two — so everything looks
-   green while the new node's local etcd is quietly useless.
-2. The credentials play at the top of `install.yml` runs on `hosts:
-   localhost` and hands out every service password via `add_host`. If
-   `localhost` isn't included in `--limit`, that whole play is skipped and
-   every role on the target node renders with missing/placeholder
-   passwords.
+You should see the two survivors both `Primary`/`Synced`. With only 2 of 3
+nodes up, the cluster is still quorate (Galera needs a strict majority — 2
+of 3), but a second node loss would take the whole cluster down, so replace
+the dead node promptly.
 
 **Step by step:**
 
-1. **Confirm the surviving 2 nodes are healthy first** (see above) — don't
-   start etcd surgery on a cluster that isn't already stable.
+1. **Confirm the surviving 2 nodes are healthy first** (see above).
 
-2. **On a surviving node, find and remove the dead etcd member:**
-   ```bash
-   etcdctl --endpoints=http://127.0.0.1:2379 member list
-   etcdctl --endpoints=http://127.0.0.1:2379 member remove <old-member-id>
-   ```
-
-3. **Pre-register the replacement as a new member**, so the existing
-   cluster is expecting it before its etcd process ever starts (name must
-   match `{{ etcd_cluster_name }}-{{ inventory_hostname }}`, default
-   `etcd_cluster_name` is `pg-ha-etcd`):
-   ```bash
-   etcdctl --endpoints=http://127.0.0.1:2379 member add pg-ha-etcd-pg-node-1 \
-       --peer-urls=http://<pg-node-1-ip>:2380
-   ```
-
-4. **Provision the replacement VM.** Reuse the same hostname (`pg-node-1`)
+2. **Provision the replacement VM.** Reuse the same hostname (`db-node-1`)
    and IP if at all possible — it matches what's already in
-   `inventory/hosts.yml` and what every other node's rendered config
-   points at. If the IP has to change, update
-   `inventory/hosts.yml` first and redo step 3 with the new IP.
+   `inventory/hosts.yml` and what every other node's `wsrep_cluster_address`
+   points at. If the IP has to change, update `inventory/hosts.yml` first.
 
-5. **Run the build against just that node (plus `localhost` for
+3. **Run the build against just that node (plus `localhost` for
    credentials):**
    ```bash
-   ansible-playbook install.yml --limit "localhost,pg-node-1"
+   ansible-playbook install.yml --limit "localhost,db-node-1"
    ```
-   This will still render `initial-cluster-state: 'new'` and start etcd
-   wrong — that's expected, fix it next.
+   `mysql_galera`'s peer-liveness check (in `roles/mysql_galera/tasks/main.yml`)
+   will detect that db-node-2/3 already have a live cluster and skip
+   bootstrap automatically — db-node-1 just starts normally and clones the
+   full dataset via SST (`xtrabackup-v2`), even though it's `db_nodes[0]`
+   and would otherwise be the deterministic bootstrap node. No manual
+   membership surgery needed.
 
-6. **Fix etcd on the replacement node** so it actually joins as the member
-   you pre-registered in step 3, instead of running as an orphaned
-   single-node cluster:
-   ```bash
-   sudo systemctl stop etcd
-   sudo rm -rf /var/lib/etcd/*
-   sudo sed -i "s/initial-cluster-state: 'new'/initial-cluster-state: 'existing'/" /etc/etcd/etcd.conf.yml
-   sudo systemctl start etcd
-   etcdctl --endpoints=http://127.0.0.1:2379 member list
-   ```
-   Confirm all 3 members show up and `endpoint health` is green **from
-   each** node, not just the new one. Note that a future `install.yml` run
-   touching this node will re-render the config back to
-   `initial-cluster-state: 'new'` (the role doesn't know the difference) —
-   harmless once the node has already joined and has cluster state on
-   disk, since etcd ignores `initial-cluster-state` after the first
-   successful start, but worth knowing if you're troubleshooting later.
-
-7. **Restart Patroni on the replacement node** to make sure it's cloning
-   against the now-correctly-joined local etcd rather than whatever it
-   improvised during step 5:
-   ```bash
-   sudo systemctl restart patroni
-   ```
-   Watch `journalctl -u patroni -f` — it should detect the existing leader
-   and clone as a replica via `pg_basebackup`.
-
-8. **Verify the cluster is back to full strength:**
+4. **Verify the cluster is back to full strength:**
    ```bash
    ansible-playbook playbooks/cluster_health.yml
    ```
-   Expect 1 primary, 2 replicas, all 3 etcd members healthy.
+   Expect all 3 DB nodes `Primary`/`Synced`, and HAProxy routing writes back
+   to db-node-1 once its `clustercheck` passes.

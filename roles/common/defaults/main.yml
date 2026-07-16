@@ -12,7 +12,7 @@ common_packages:
   - sysstat
   - python3
   - python3-pip
-  - python3-psycopg2
+  - python3-pymysql
   - acl
   - jq
   - rsync
@@ -20,6 +20,7 @@ common_packages:
   - numactl
   - pciutils
   - nvme-cli
+  - socat
 
 vm_swappiness: 1
 vm_overcommit_memory: 2
@@ -31,7 +32,12 @@ fs_file_max: 1048576
 # ── Hardware requirements ────────────────────────────────────────────────
 # Hard minimums (any node): fails the play if unmet.
 min_cpu_vcpus: 4
-min_ram_mb: 7800          # ~8GB; leaves headroom for firmware/hypervisor-reserved memory
+min_ram_mb: 11800         # ~12GB; leaves headroom for firmware/hypervisor-reserved memory.
+                          # Higher than a bare "8GB is enough for a database" floor because
+                          # InnoDB's buffer pool takes ~70% of RAM (vs. ~25% for Postgres's
+                          # shared_buffers), and Galera's gcache adds a further fixed ~1GB
+                          # on top of that — see innodb_buffer_pool_pct / galera_gcache_size_mb
+                          # in group_vars/all/01-vars.yml.
 min_os_disk_gb: 50
 # Recommended-only (DB nodes): reported as a warning, never fails the play.
 db_recommended_cpu_vcpus: 8

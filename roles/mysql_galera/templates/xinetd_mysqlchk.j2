@@ -1,0 +1,21 @@
+# =============================================================================
+# clustercheck xinetd service — managed by Ansible (role: mysql_galera)
+# Node: {{ inventory_hostname }}
+#
+# HAProxy (proxy nodes) polls this port instead of querying wsrep status
+# directly.
+# =============================================================================
+service mysqlchk
+{
+    disable         = no
+    flags           = REUSE
+    socket_type     = stream
+    port            = {{ clustercheck_port }}
+    wait            = no
+    user            = nobody
+    server          = /usr/bin/clustercheck
+    server_args     = {{ health_user }} {{ health_pass }} 0 /var/log/mysqlchk.log 1 /root/.my.cnf
+    log_on_failure  += USERID
+    only_from       = {% for host in groups['proxy_nodes'] %}{{ hostvars[host].ansible_host }} {% endfor %}127.0.0.1
+    per_source      = UNLIMITED
+}

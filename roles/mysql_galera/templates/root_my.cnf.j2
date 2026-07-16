@@ -1,0 +1,5 @@
+# Managed by Ansible (role: mysql_galera) — passwordless local admin access
+[client]
+user     = root
+password = "{{ mysql_root_pass }}"
+socket   = {{ mysql_socket }}

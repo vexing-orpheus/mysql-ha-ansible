@@ -39,26 +39,34 @@ listen stats
     stats               show-legends
     stats               admin if TRUE
 
-listen postgresql_primary
+# Galera has no single elected leader, so "who takes writes" is a static
+# priority order instead of a dynamic role lookup: the first DB node is the
+# active writer, and the rest are HAProxy `backup` servers that only take
+# over once it's unhealthy. The health check itself (clustercheck, port
+# {{ clustercheck_port }} on each DB node) just reports whether that node is
+# synced and not acting as an SST donor — it doesn't encode which node
+# "should" be primary.
+listen mysql_write
     bind                *:{{ haproxy_write_port }}
     mode                tcp
     option              tcplog
-    option              httpchk GET /master
+    option              httpchk GET /
     http-check          expect status 200
     default-server      inter 3s fastinter 1s downinter 5s rise 2 fall 3 on-marked-down shutdown-sessions
     balance             first
 {% for host in groups['db_nodes'] %}
-    server  {{ host }}  {{ hostvars[host].ansible_host }}:{{ pg_port }}  check port {{ patroni_api_port }}
-{% endfor %}
+    server  {{ host }}  {{ hostvars[host].ansible_host }}:{{ mysql_port }}  check port {{ clustercheck_port }}{% if not loop.first %} backup{% endif %}
 
-listen postgresql_replicas
+{% endfor %}
+# All synced nodes (including the current writer) serve reads round-robin.
+listen mysql_read
     bind                *:{{ haproxy_read_port }}
     mode                tcp
     option              tcplog
-    option              httpchk GET /replica
+    option              httpchk GET /
     http-check          expect status 200
     default-server      inter 3s fastinter 1s downinter 5s rise 2 fall 3 on-marked-down shutdown-sessions
     balance             roundrobin
 {% for host in groups['db_nodes'] %}
-    server  {{ host }}  {{ hostvars[host].ansible_host }}:{{ pg_port }}  check port {{ patroni_api_port }}
+    server  {{ host }}  {{ hostvars[host].ansible_host }}:{{ mysql_port }}  check port {{ clustercheck_port }}
 {% endfor %}

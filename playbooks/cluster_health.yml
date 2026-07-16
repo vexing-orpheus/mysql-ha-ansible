@@ -42,13 +42,13 @@
 
     - name: Prompt for health-check DB username
       ansible.builtin.pause:
-        prompt: "Health-check DB username [pgchecker]"
+        prompt: "Health-check (clustercheck) DB username [clustercheck]"
       register: p_health_user
       when: standalone_run and health_user is not defined
 
     - name: Prompt for health-check DB password
       ansible.builtin.pause:
-        prompt: "Health-check DB password"
+        prompt: "Health-check (clustercheck) DB password"
         echo: false
       register: p_health_pass
       when: standalone_run and health_pass is not defined
@@ -84,7 +84,7 @@
       ansible.builtin.set_fact:
         resolved_ssh_user: "{{ ssh_user | default(p_ssh_user.user_input | default('', true)) }}"
         resolved_ssh_pass: "{{ ssh_pass | default(p_ssh_pass.user_input | default('', true)) }}"
-        resolved_health_user: "{{ health_user | default(p_health_user.user_input | default('pgchecker', true)) }}"
+        resolved_health_user: "{{ health_user | default(p_health_user.user_input | default('clustercheck', true)) }}"
         resolved_health_pass: "{{ health_pass | default(p_health_pass.user_input | default('', true)) }}"
         resolved_haproxy_stats_user: "{{ haproxy_stats_user | default(p_haproxy_stats_user.user_input | default('haproxyadmin', true)) }}"
         resolved_haproxy_stats_pass: "{{ haproxy_stats_pass | default(p_haproxy_stats_pass.user_input | default('', true)) }}"
@@ -99,7 +99,7 @@
         ansible_user: "{{ resolved_ssh_user }}"
         ansible_password: "{{ resolved_ssh_pass if (resolved_ssh_pass | length > 0) else omit }}"
         ansible_become_password: "{{ resolved_ssh_pass if (resolved_ssh_pass | length > 0) else omit }}"
-      loop: "{{ groups['pg_ha_cluster'] }}"
+      loop: "{{ groups['mysql_ha_cluster'] }}"
       when: standalone_run
       no_log: true
 
@@ -129,65 +129,81 @@
       when: standalone_run
       no_log: true
 
-- name: Patroni cluster status
+- name: Galera cluster status
   hosts: db_nodes
   become: false
   gather_facts: false
   vars_files:
     - ../group_vars/all/01-vars.yml
   tasks:
-    - name: Query Patroni REST API
-      ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ patroni_api_port }}/patroni"
-        return_content: true
-        status_code: 200
-      register: patroni_status
-      failed_when: false
-
-    - name: Report role
-      ansible.builtin.debug:
-        msg: >-
-          {{ inventory_hostname }}:
-          {{ patroni_status.json.role | default('UNREACHABLE') }}
-
-    - name: Collect roles on the control node
-      ansible.builtin.set_fact:
-        node_role: "{{ patroni_status.json.role | default('unreachable') }}"
-
-    - name: Check WAL archiver failures
-      community.postgresql.postgresql_query:
+    - name: Query wsrep local state
+      community.mysql.mysql_query:
         login_user: "{{ health_user }}"
         login_password: "{{ health_pass }}"
-        login_host: 127.0.0.1
-        login_port: "{{ pg_port }}"
-        db: postgres
-        query: "SELECT failed_count, last_archived_time, last_failed_time FROM pg_stat_archiver"
-      register: archiver_status
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "SHOW STATUS LIKE 'wsrep_local_state_comment'"
+      register: wsrep_local_state
       failed_when: false
 
-    - name: Set archiver_failed_count fact
-      ansible.builtin.set_fact:
-        archiver_failed_count: "{{ archiver_status.query_result[0].failed_count | default(0) if archiver_status is succeeded else 0 }}"
+    - name: Query wsrep cluster status (Primary component membership)
+      community.mysql.mysql_query:
+        login_user: "{{ health_user }}"
+        login_password: "{{ health_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "SHOW STATUS LIKE 'wsrep_cluster_status'"
+      register: wsrep_cluster_status
+      failed_when: false
 
-    - name: Report WAL archiver status
+    - name: Query wsrep cluster size (as seen by this node)
+      community.mysql.mysql_query:
+        login_user: "{{ health_user }}"
+        login_password: "{{ health_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "SHOW STATUS LIKE 'wsrep_cluster_size'"
+      register: wsrep_cluster_size
+      failed_when: false
+
+    - name: Query wsrep ready flag
+      community.mysql.mysql_query:
+        login_user: "{{ health_user }}"
+        login_password: "{{ health_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "SHOW STATUS LIKE 'wsrep_ready'"
+      register: wsrep_ready
+      failed_when: false
+
+    - name: Set per-node wsrep facts (for the control node to aggregate)
+      ansible.builtin.set_fact:
+        node_state: "{{ wsrep_local_state.query_result[0][0].Value | default('UNREACHABLE') if wsrep_local_state is succeeded else 'UNREACHABLE' }}"
+        node_cluster_status: "{{ wsrep_cluster_status.query_result[0][0].Value | default('unknown') if wsrep_cluster_status is succeeded else 'unknown' }}"
+        node_cluster_size: "{{ wsrep_cluster_size.query_result[0][0].Value | default(0) if wsrep_cluster_size is succeeded else 0 }}"
+        node_ready: "{{ wsrep_ready.query_result[0][0].Value | default('OFF') if wsrep_ready is succeeded else 'OFF' }}"
+
+    - name: Report this node's Galera status
       ansible.builtin.debug:
         msg: >-
-          {{ inventory_hostname }}: WAL archiver failed_count={{ archiver_failed_count }},
-          last_archived={{ archiver_status.query_result[0].last_archived_time | default('never') if archiver_status is succeeded else 'UNKNOWN' }}
+          {{ inventory_hostname }}: state={{ node_state }},
+          cluster_status={{ node_cluster_status }},
+          cluster_size={{ node_cluster_size }}, ready={{ node_ready }}
 
-    - name: Check pgbackrest backup freshness (current primary only)
-      when: node_role in ['master', 'primary']
+- name: Backup freshness on the designated backup node
+  hosts: db_nodes
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
+  tasks:
+    - name: Verify the most recent backup is within the freshness threshold
+      when: inventory_hostname == xtrabackup_backup_node
       block:
-        - name: Verify the most recent backup is within the freshness threshold
+        - name: Check latest backup age
           ansible.builtin.shell: |
             set -o pipefail
-            latest=$(pgbackrest --stanza={{ patroni_scope }} info --output=json | jq -r '.[0].backup[-1].timestamp.stop // 0')
-            now=$(date +%s)
-            age_hours=$(( (now - latest) / 3600 ))
-            [ "${latest}" -gt 0 ] && [ "${age_hours}" -lt {{ pgbackrest_backup_freshness_hours }} ]
+            latest=$(find {{ xtrabackup_repo_path }} -maxdepth 1 \( -name 'full-*' -o -name 'diff-*' \) -type d 2>/dev/null | sort | tail -1)
+            [ -n "${latest}" ] && [ -f "${latest}/xtrabackup_checkpoints" ] || exit 1
+            age_hours=$(( ( $(date +%s) - $(stat -c %Y "${latest}/xtrabackup_checkpoints") ) / 3600 ))
+            [ "${age_hours}" -lt {{ xtrabackup_backup_freshness_hours }} ]
           register: backup_freshness_check
-          become: true
-          become_user: postgres
           changed_when: false
           failed_when: false
           args:
@@ -201,47 +217,15 @@
           ansible.builtin.debug:
             msg: >-
               {{ inventory_hostname }}: most recent backup is
-              {{ 'STALE (older than ' ~ pgbackrest_backup_freshness_hours ~ 'h) or missing' if backup_stale else 'fresh' }}
+              {{ 'STALE (older than ' ~ xtrabackup_backup_freshness_hours ~ 'h) or missing' if backup_stale else 'fresh' }}
 
-- name: etcd cluster health
-  hosts: db_nodes
-  become: false
-  gather_facts: false
-  vars_files:
-    - ../group_vars/all/01-vars.yml
-  tasks:
-    - name: etcd endpoint health
-      ansible.builtin.command: >
-        etcdctl --endpoints=http://127.0.0.1:{{ etcd_client_port }} endpoint health
-      environment:
-        ETCDCTL_API: "3"
-      register: etcd_health
-      changed_when: false
-      failed_when: false
-
-    - name: Report etcd health
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: {{ 'healthy' if etcd_health.rc == 0 else 'UNHEALTHY' }}"
-
-- name: Proxy layer — PgBouncer, HAProxy, Keepalived/VIP
+- name: Proxy layer — HAProxy, Keepalived/VIP
   hosts: proxy_nodes
   become: false
   gather_facts: false
   vars_files:
     - ../group_vars/all/01-vars.yml
   tasks:
-    - name: Check PgBouncer is listening
-      ansible.builtin.wait_for:
-        port: "{{ pgbouncer_port }}"
-        host: 127.0.0.1
-        timeout: 3
-      register: pgbouncer_check
-      failed_when: false
-
-    - name: Report PgBouncer
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: PgBouncer {{ 'UP' if pgbouncer_check is succeeded else 'DOWN' }}"
-
     - name: Check HAProxy stats
       ansible.builtin.uri:
         url: "http://127.0.0.1:{{ haproxy_stats_port }}/stats;csv"
@@ -255,7 +239,7 @@
     - name: Count UP write backends
       ansible.builtin.set_fact:
         write_backends_up: >-
-          {{ (haproxy_stats.content | default('') | regex_findall('postgresql_primary,[^\n]*,UP,')) | length }}
+          {{ (haproxy_stats.content | default('') | regex_findall('mysql_write,[^\n]*,UP,')) | length }}
       when: haproxy_stats is succeeded
 
     - name: Report HAProxy write backends
@@ -277,9 +261,11 @@
   hosts: db_nodes
   become: false
   gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
   tasks:
-    - name: Check /var/lib/postgresql usage
-      ansible.builtin.shell: df -h /var/lib/postgresql | tail -1
+    - name: Check MySQL data directory usage
+      ansible.builtin.shell: df -h {{ mysql_data_dir }} | tail -1
       register: disk_usage
       changed_when: false
 
@@ -294,57 +280,49 @@
   vars_files:
     - ../group_vars/all/01-vars.yml
   tasks:
-    - name: Count primaries and replicas
+    - name: Count nodes fully in the Primary component and ready
       ansible.builtin.set_fact:
-        primary_count: >-
+        healthy_count: >-
           {{ groups['db_nodes']
-             | map('extract', hostvars, 'node_role')
-             | select('in', ['master', 'primary'])
+             | map('extract', hostvars, 'node_cluster_status')
+             | select('equalto', 'Primary')
              | list | length }}
-        replica_count: >-
+        synced_count: >-
           {{ groups['db_nodes']
-             | map('extract', hostvars, 'node_role')
-             | select('in', ['replica', 'standby'])
+             | map('extract', hostvars, 'node_state')
+             | select('equalto', 'Synced')
              | list | length }}
 
     - name: Start with an empty problem list
       ansible.builtin.set_fact:
         health_problems: []
 
-    - name: Flag unreachable or missing Patroni roles
+    - name: Flag unreachable nodes
       ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + [item ~ ': Patroni role UNREACHABLE'] }}"
+        health_problems: "{{ health_problems + [item ~ ': wsrep state UNREACHABLE'] }}"
       loop: "{{ groups['db_nodes'] }}"
-      when: hostvars[item].node_role | default('unreachable') == 'unreachable'
+      when: hostvars[item].node_state | default('UNREACHABLE') == 'UNREACHABLE'
 
-    - name: Flag wrong primary count
+    - name: Flag nodes outside the Primary component
       ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + ['Expected exactly 1 Patroni primary, found ' ~ primary_count ~ ' (split-brain or full outage)'] }}"
-      when: primary_count | int != 1
-
-    - name: Flag etcd member health
-      ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + [item ~ ': etcd UNHEALTHY'] }}"
+        health_problems: "{{ health_problems + [item ~ ': wsrep_cluster_status=' ~ hostvars[item].node_cluster_status ~ ' (expected Primary — possible partition/split-brain)'] }}"
       loop: "{{ groups['db_nodes'] }}"
-      when: (hostvars[item].etcd_health.rc | default(1)) != 0
+      when: >-
+        hostvars[item].node_state | default('UNREACHABLE') != 'UNREACHABLE' and
+        hostvars[item].node_cluster_status | default('unknown') != 'Primary'
 
-    - name: Flag WAL archiving failures
+    - name: Flag nodes not yet Synced (e.g. mid-SST as a donor or joiner)
       ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + [item ~ ': WAL archiving has ' ~ (hostvars[item].archiver_failed_count | default(0)) ~ ' failed attempt(s)'] }}"
+        health_problems: "{{ health_problems + [item ~ ': wsrep state is ' ~ hostvars[item].node_state ~ ' (not Synced)'] }}"
       loop: "{{ groups['db_nodes'] }}"
-      when: (hostvars[item].archiver_failed_count | default(0) | int) > 0
+      when: >-
+        hostvars[item].node_state | default('UNREACHABLE') not in ['UNREACHABLE', 'Synced']
 
-    - name: Flag a stale or missing backup on the current primary
+    - name: Flag a stale or missing backup on the designated backup node
       ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + [item ~ ': most recent backup is stale or missing (older than ' ~ pgbackrest_backup_freshness_hours ~ 'h)'] }}"
+        health_problems: "{{ health_problems + [item ~ ': most recent backup is stale or missing (older than ' ~ xtrabackup_backup_freshness_hours ~ 'h)'] }}"
       loop: "{{ groups['db_nodes'] }}"
       when: hostvars[item].backup_stale | default(false)
-
-    - name: Flag PgBouncer down
-      ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + [item ~ ': PgBouncer DOWN'] }}"
-      loop: "{{ groups['proxy_nodes'] }}"
-      when: hostvars[item].pgbouncer_check is not succeeded
 
     - name: Flag no HAProxy write backends up
       ansible.builtin.set_fact:
@@ -364,18 +342,20 @@
         method: POST
         body_format: json
         body: >-
-          {{ {alert_webhook_payload_key: ('pg-ha-cluster health check failed:\n' ~ (health_problems | join('\n')))} }}
+          {{ {alert_webhook_payload_key: ('mysql-ha-cluster health check failed:\n' ~ (health_problems | join('\n')))} }}
         status_code: [200, 204]
       when: health_problems | length > 0
       failed_when: false
 
-    - name: Warn if fewer than 2 replicas
+    - name: Warn if fewer than 3 nodes are Synced
       ansible.builtin.debug:
-        msg: "WARNING: only {{ replica_count }} healthy replica(s), expected 2"
-      when: replica_count | int < 2
+        msg: "WARNING: only {{ synced_count }} of {{ groups['db_nodes'] | length }} node(s) are Synced"
+      when: synced_count | int < (groups['db_nodes'] | length)
 
-    - name: Assert exactly one primary
+    - name: Assert full cluster membership (every DB node in the Primary component)
       ansible.builtin.assert:
-        that: primary_count | int == 1
-        fail_msg: "Expected exactly 1 Patroni primary, found {{ primary_count }} (split-brain or full outage)."
-        success_msg: "Primary count OK: {{ primary_count }}"
+        that: healthy_count | int == (groups['db_nodes'] | length)
+        fail_msg: >-
+          Expected all {{ groups['db_nodes'] | length }} DB nodes in the Primary
+          component, found {{ healthy_count }} (partition or outage).
+        success_msg: "Cluster membership OK: {{ healthy_count }}/{{ groups['db_nodes'] | length }}"

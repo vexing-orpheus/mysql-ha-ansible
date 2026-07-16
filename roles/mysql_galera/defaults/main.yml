@@ -1,0 +1,17 @@
+---
+mysql_service_wait_retries: 60
+mysql_service_wait_delay:   2
+wsrep_sync_wait_retries:    60
+wsrep_sync_wait_delay:      2
+peer_check_timeout:         2
+
+wsrep_provider_path: /usr/lib/galera4/libgalera_smm.so
+
+# max_connections is scaled down from mysql_max_connections (the ceiling, in
+# group_vars/all/01-vars.yml) on smaller nodes, so a minimum-spec node
+# doesn't advertise more connections than its RAM can actually back once the
+# InnoDB buffer pool and Galera's gcache are accounted for. See
+# "Compute a RAM-aware max_connections ceiling" in tasks/main.yml.
+mysql_conn_reserved_os_mb:   1024   # left for OS/mysqld overhead, outside the buffer pool/gcache
+mysql_conn_per_connection_mb: 4     # conservative per-connection working-memory budget
+mysql_conn_min:              50    # never scale below this, however little RAM is left over

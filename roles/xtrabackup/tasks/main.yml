@@ -1,0 +1,82 @@
+---
+# =============================================================================
+# xtrabackup — full/diff backups, integrity check, and restore verification.
+#
+# Every DB node holds an identical copy of the data (Galera synchronous
+# replication), so there's no "whichever node is currently primary" logic
+# here. Backups just run on one fixed node (xtrabackup_backup_node,
+# group_vars/all/01-vars.yml), which is neither the HAProxy-designated write
+# node nor left to chase cluster state.
+# =============================================================================
+
+- name: Report that this node is not the designated backup node
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: not xtrabackup_backup_node
+      ({{ xtrabackup_backup_node }}) — skipping backup setup on this node.
+  when: inventory_hostname != xtrabackup_backup_node
+
+- name: Backup setup (designated backup node only)
+  when: inventory_hostname == xtrabackup_backup_node
+  block:
+    - name: Install Percona XtraBackup (idempotent — mysql_galera already installs it for SST)
+      ansible.builtin.apt:
+        name: percona-xtrabackup-80
+        state: present
+
+    - name: Create xtrabackup directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - "{{ xtrabackup_repo_path }}"
+        - "{{ xtrabackup_log_path }}"
+        - "{{ xtrabackup_restore_verify_path }}"
+
+    - name: Create xtrabackup scripts directory
+      ansible.builtin.file:
+        path: "{{ xtrabackup_scripts_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Deploy alert + backup/check/restore-verify scripts
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "{{ xtrabackup_scripts_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - alert.sh
+        - backup.sh
+        - check.sh
+        - restore_verify.sh
+
+    - name: Deploy backup/check/restore-verify cron jobs
+      ansible.builtin.cron:
+        name: "{{ item.name }}"
+        user: root
+        minute: "{{ item.schedule.minute | default('*') }}"
+        hour: "{{ item.schedule.hour | default('*') }}"
+        weekday: "{{ item.schedule.weekday | default('*') }}"
+        job: "{{ xtrabackup_scripts_dir }}/{{ item.script }} >> {{ xtrabackup_log_path }}/{{ item.name | replace(' ', '_') }}.log 2>&1"
+      loop:
+        - name: xtrabackup full backup
+          script: backup.sh full
+          schedule: "{{ xtrabackup_full_backup_cron }}"
+        - name: xtrabackup diff backup
+          script: backup.sh diff
+          schedule: "{{ xtrabackup_diff_backup_cron }}"
+        - name: xtrabackup check
+          script: check.sh
+          schedule: "{{ xtrabackup_check_cron }}"
+        - name: xtrabackup restore verify
+          script: restore_verify.sh
+          schedule: "{{ xtrabackup_restore_verify_cron }}"
+      loop_control:
+        label: "{{ item.name }}"

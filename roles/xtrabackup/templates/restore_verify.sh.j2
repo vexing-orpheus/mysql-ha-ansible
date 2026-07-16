@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# XtraBackup restore verification — managed by Ansible (role: xtrabackup)
+#
+# Prepares and restores the latest full backup into a scratch directory,
+# boots a temporary standalone (non-Galera) mysqld on a throwaway port, runs
+# a liveness query, then tears it all down. Never touches the real data
+# directory, port, or the cluster itself.
+set -uo pipefail
+
+BACKUP_ROOT="{{ xtrabackup_repo_path }}"
+SCRATCH="{{ xtrabackup_restore_verify_path }}"
+PORT="{{ xtrabackup_restore_verify_port }}"
+LOG="{{ xtrabackup_log_path }}/restore_verify.log"
+ALERT="{{ xtrabackup_scripts_dir }}/alert.sh"
+MYSQL_ROOT_PASS="{{ mysql_root_pass }}"
+
+fail() {
+    "${ALERT}" "Restore verification FAILED on $(hostname -s): $1"
+    exit 1
+}
+
+cleanup() {
+    if [[ -S "${SCRATCH}/mysqld.sock" ]]; then
+        mysqladmin --socket="${SCRATCH}/mysqld.sock" -uroot -p"${MYSQL_ROOT_PASS}" shutdown >/dev/null 2>&1 || true
+    fi
+    [[ -f "${SCRATCH}/mysqld.pid" ]] && kill "$(cat "${SCRATCH}/mysqld.pid")" >/dev/null 2>&1 || true
+    rm -rf "${SCRATCH:?}"/*
+}
+trap cleanup EXIT
+
+LATEST_FULL=$(find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d | sort | tail -1)
+[[ -n "${LATEST_FULL}" ]] || fail "no full backup found under ${BACKUP_ROOT}"
+
+rm -rf "${SCRATCH:?}"/*
+mkdir -p "${SCRATCH}/prepare" "${SCRATCH}/datadir"
+cp -a "${LATEST_FULL}/." "${SCRATCH}/prepare/"
+
+xtrabackup --prepare --target-dir="${SCRATCH}/prepare" >>"${LOG}" 2>&1 \
+    || fail "xtrabackup --prepare failed"
+
+xtrabackup --copy-back --target-dir="${SCRATCH}/prepare" --datadir="${SCRATCH}/datadir" \
+    >>"${LOG}" 2>&1 \
+    || fail "xtrabackup --copy-back failed"
+
+chown -R mysql:mysql "${SCRATCH}/datadir"
+
+runuser -u mysql -- mysqld --no-defaults \
+    --datadir="${SCRATCH}/datadir" \
+    --socket="${SCRATCH}/mysqld.sock" \
+    --port="${PORT}" \
+    --pid-file="${SCRATCH}/mysqld.pid" \
+    --wsrep-provider=none \
+    --skip-networking=0 \
+    --log-error="${SCRATCH}/mysqld.log" &
+
+READY=0
+for _ in $(seq 1 30); do
+    if mysqladmin --socket="${SCRATCH}/mysqld.sock" -uroot -p"${MYSQL_ROOT_PASS}" ping >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 1
+done
+[[ "${READY}" -eq 1 ]] || fail "temporary MySQL instance never became ready"
+
+mysql --socket="${SCRATCH}/mysqld.sock" -uroot -p"${MYSQL_ROOT_PASS}" -e "SELECT 1;" >/dev/null \
+    || fail "liveness query against restored instance failed"
+
+logger -t xtrabackup-restore-verify "Restore verification OK on $(hostname -s)"

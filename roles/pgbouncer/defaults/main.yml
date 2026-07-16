@@ -1,7 +1,0 @@
----
-pgbouncer_conf_dir: /etc/pgbouncer
-pgbouncer_log_dir: /var/log/pgbouncer
-pgbouncer_run_dir: /var/run/pgbouncer
-pgbouncer_server_idle_timeout: 600
-pgbouncer_client_idle_timeout: 0
-pgbouncer_min_peer_version: "1.21"

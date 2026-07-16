@@ -1,11 +1,11 @@
 ---
 # =============================================================================
 # Global cluster variables — x86_64 only. Non-secret settings live here.
-# Credentials (PostgreSQL/PgBouncer/HAProxy/keepalived accounts, the alert
-# webhook) are never committed to disk — they're prompted for interactively
-# by install.yml's "Collect connection credentials and cluster secrets" play
-# (and by playbooks/cluster_health.yml's own prompt when run standalone).
-# See README.md.
+# Credentials (MySQL root/SST/app accounts, HAProxy stats, keepalived VRRP,
+# the alert webhook) are never committed to disk — they're prompted for
+# interactively by install.yml's "Collect connection credentials and cluster
+# secrets" play (and by playbooks/cluster_health.yml's own prompt when run
+# standalone). See README.md.
 # =============================================================================
 
 # ── Network ───────────────────────────────────────────────────────────────
@@ -23,46 +23,56 @@ vrrp_router_id:     51
 # vrrp_auth_pass is prompted for interactively — see the header note above.
 
 # ── Cluster identity ─────────────────────────────────────────────────────
-patroni_scope:     pg-ha-cluster
-etcd_cluster_name: pg-ha-etcd
+galera_cluster_name: mysql-ha-cluster
 
-# ── PostgreSQL ────────────────────────────────────────────────────────────
-pg_version: 18                              # override with -e pg_version=16
-pg_port:    5432
-pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
-pg_log_dir:  /var/log/postgresql
+# ── MySQL / Percona XtraDB Cluster ───────────────────────────────────────
+percona_product_series: pxc80                # Percona repo series — override with -e for a different major version
+mysql_port:        3306
+mysql_data_dir:    /var/lib/mysql
+mysql_log_dir:     /var/log/mysql
+mysql_socket:      /var/run/mysqld/mysqld.sock
 
 # Auto-sized at role runtime from ansible_memtotal_mb; override to pin.
-# shared_buffers_override: 8GB
-# effective_cache_size_override: 24GB
-work_mem: 16MB
-maintenance_work_mem: 256MB
+# innodb_buffer_pool_size_override: 8G
+innodb_buffer_pool_pct: 70                   # % of RAM given to InnoDB's buffer pool
+galera_gcache_size_mb:  1024                 # Galera write-set cache (gcache.size)
 
-random_page_cost: "1.1"                     # NVMe/SSD default
-effective_io_concurrency: 200
+# Ceiling for well-provisioned nodes — roles/mysql_galera scales this down on
+# smaller ones using whatever RAM is left over after the buffer pool and
+# gcache (see mysql_conn_* in roles/mysql_galera/defaults/main.yml), so a
+# minimum-spec node never advertises more connections than it can back.
+# mysql_max_connections_override: 300        # pin a fixed value, bypassing the RAM-based calc
+mysql_max_connections:  500
 
 # ── Ports ─────────────────────────────────────────────────────────────────
-patroni_api_port:    8008
-etcd_client_port:    2379
-etcd_peer_port:      2380
-pgbouncer_port:      5433
-haproxy_write_port:  5000
-haproxy_read_port:   5001
-haproxy_stats_port:  7000
+galera_replication_port: 4567                # wsrep group communication (tcp+udp)
+galera_ist_port:         4568                # incremental state transfer
+galera_sst_port:         4444                # state snapshot transfer (xtrabackup-v2)
+clustercheck_port:       9200                # local health endpoint HAProxy polls (one per DB node)
+haproxy_write_port:      5000
+haproxy_read_port:       5001
+haproxy_stats_port:      7000
 
-# ── PgBouncer tuning ──────────────────────────────────────────────────────
-pgbouncer_pool_mode: transaction
-pgbouncer_max_client_conn: 1000
-pgbouncer_default_pool_size: 20
-pgbouncer_min_pool_size: 5
-pgbouncer_reserve_pool_size: 5
-
-# ── Backups / archiving / alerts ──────────────────────────────────────────
+# ── Backups / alerts ──────────────────────────────────────────────────────
 # Global (not role defaults) because playbooks/cluster_health.yml can run
-# standalone, without the pgbackrest role ever having run in that process.
+# standalone, without the xtrabackup role ever having run in that process.
 # alert_webhook_url is prompted for interactively — see the header note above.
 alert_webhook_payload_key: text   # "text" for Slack, "content" for Discord
 
+# Global (not a role default) because playbooks/cluster_health.yml reads
+# backups directly off disk here, without the xtrabackup role's own defaults
+# ever being loaded when it runs standalone.
+xtrabackup_repo_path: /var/lib/xtrabackup
+
 # How stale the most recent successful backup is allowed to be before
 # cluster_health.yml reports it unhealthy.
-pgbackrest_backup_freshness_hours: 26
+xtrabackup_backup_freshness_hours: 26
+
+# Every DB node holds an identical copy of the data (Galera synchronous
+# replication), so there's no need to chase "whichever node is primary" —
+# backups just run on one fixed node, chosen to be neither the
+# HAProxy-designated write node (db_nodes[0], see haproxy_keepalived) nor
+# left undefined. Global (not a role default) because cluster_health.yml
+# checks freshness on this node even when it runs standalone, without the
+# xtrabackup role ever having executed in that run.
+xtrabackup_backup_node: "{{ groups['db_nodes'][1] }}"

@@ -1,0 +1,276 @@
+---
+# =============================================================================
+# mysql_galera — installs Percona XtraDB Cluster and forms the Galera cluster.
+#
+# Galera has its own built-in group communication/quorum, no external
+# consensus store needed. To make first-cluster bootstrap deterministic
+# rather than a race, this role's play runs with `serial: 1` in install.yml,
+# in inventory order (db-node-1 first): the first DB node bootstraps a
+# brand-new cluster only if no peer already has one running; every other
+# node (and every node on a re-run against an already-live cluster) just
+# starts normally and joins via IST/SST from whichever peers are already up.
+# =============================================================================
+
+- name: Install Percona XtraDB Cluster and XtraBackup packages
+  ansible.builtin.apt:
+    name:
+      - percona-xtradb-cluster
+      - percona-xtrabackup-80
+      - qpress
+    state: present
+  register: pxc_install
+
+- name: Wait for the freshly installed MySQL service to accept local connections
+  ansible.builtin.wait_for:
+    path: "{{ mysql_socket }}"
+    timeout: 60
+
+- name: Set the MySQL root password (idempotent — falls back to passwordless local auth on first run)
+  community.mysql.mysql_user:
+    name: root
+    host: localhost
+    password: "{{ mysql_root_pass }}"
+    login_user: root
+    login_password: "{{ mysql_root_pass }}"
+    check_implicit_admin: true
+    login_unix_socket: "{{ mysql_socket }}"
+    state: present
+
+- name: Write root's .my.cnf for passwordless local admin access
+  ansible.builtin.template:
+    src: root_my.cnf.j2
+    dest: /root/.my.cnf
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Read total memory and compute InnoDB buffer pool sizing
+  ansible.builtin.set_fact:
+    innodb_buffer_pool_mb: "{{ [((ansible_memtotal_mb | int) * innodb_buffer_pool_pct // 100), 512] | max }}"
+
+- name: Set final tuning facts (allow explicit overrides)
+  ansible.builtin.set_fact:
+    innodb_buffer_pool_size: "{{ innodb_buffer_pool_size_override | default(innodb_buffer_pool_mb ~ 'M') }}"
+    innodb_buffer_pool_instances: "{{ [[((innodb_buffer_pool_mb | int) // 1024), 1] | max, 64] | min }}"
+
+- name: Compute how much RAM is left over after the buffer pool and gcache
+  ansible.builtin.set_fact:
+    mysql_conn_available_mb: "{{ (ansible_memtotal_mb | int) - (innodb_buffer_pool_mb | int) - (galera_gcache_size_mb | int) - mysql_conn_reserved_os_mb }}"
+
+- name: Compute a RAM-aware max_connections ceiling for smaller nodes
+  # mysql_max_connections (group_vars) is the ceiling for well-provisioned
+  # nodes; on smaller ones this scales it down using whatever RAM is left
+  # over after the buffer pool and gcache, so it never advertises more
+  # connections than the node can actually back.
+  ansible.builtin.set_fact:
+    mysql_max_connections_computed: >-
+      {{ [ [(mysql_conn_available_mb | int) // mysql_conn_per_connection_mb, mysql_conn_min] | max,
+           mysql_max_connections ] | min }}
+
+- name: Set final max_connections fact (allow an explicit override)
+  ansible.builtin.set_fact:
+    mysql_max_connections_final: "{{ mysql_max_connections_override | default(mysql_max_connections_computed) }}"
+
+- name: Report computed max_connections
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: max_connections={{ mysql_max_connections_final }}
+      (ceiling={{ mysql_max_connections }}, RAM={{ ansible_memtotal_mb // 1024 }}GB,
+      buffer_pool={{ innodb_buffer_pool_mb }}MB, gcache={{ galera_gcache_size_mb }}MB)
+
+- name: Ensure MySQL log directory exists
+  ansible.builtin.file:
+    path: "{{ mysql_log_dir }}"
+    state: directory
+    owner: mysql
+    group: mysql
+    mode: "0750"
+
+- name: Write Galera/wsrep configuration
+  ansible.builtin.template:
+    src: galera.cnf.j2
+    dest: /etc/mysql/conf.d/galera.cnf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Stop MySQL before applying Galera configuration
+  ansible.builtin.systemd:
+    name: mysql
+    state: stopped
+
+- name: Check whether any other DB node already has a live cluster
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[item].ansible_host }}"
+    port: "{{ mysql_port }}"
+    timeout: "{{ peer_check_timeout }}"
+    state: started
+  register: peer_check
+  loop: "{{ groups['db_nodes'] }}"
+  loop_control:
+    label: "{{ item }}"
+  when: item != inventory_hostname
+  failed_when: false
+  changed_when: false
+
+- name: Determine whether a cluster is already reachable on any peer
+  # Excludes the skipped self-check entry (when: item != inventory_hostname)
+  # first — a skipped result has no "failed" key at all, so rejectattr('failed')
+  # alone would treat it as falsy/"not failed" and inflate the reachable count.
+  ansible.builtin.set_fact:
+    cluster_already_running: >-
+      {{ peer_check.results | default([])
+         | rejectattr('skipped', 'defined')
+         | rejectattr('failed')
+         | list | length > 0 }}
+
+- name: Decide whether this node should bootstrap a brand-new cluster
+  ansible.builtin.set_fact:
+    do_bootstrap: "{{ (inventory_hostname == groups['db_nodes'][0]) and not cluster_already_running }}"
+
+- name: Report bootstrap decision
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}:
+      {{ 'bootstrapping a new cluster (--wsrep-new-cluster)' if do_bootstrap else 'joining the cluster via IST/SST' }}
+
+- name: Verify the mysql@bootstrap.service template unit is available (Percona packaging)
+  ansible.builtin.command: systemctl list-unit-files mysql@.service
+  register: mysql_bootstrap_unit_check
+  changed_when: false
+  failed_when: false
+  when: do_bootstrap
+
+- name: Fail fast if Percona's bootstrap unit is missing
+  ansible.builtin.assert:
+    that: "'mysql@.service' in mysql_bootstrap_unit_check.stdout"
+    fail_msg: >-
+      mysql@.service template unit not found — this Percona XtraDB Cluster
+      package doesn't support `systemctl start mysql@bootstrap.service`.
+      Bootstrap manually per Percona's docs, then re-run this playbook.
+  when: do_bootstrap
+
+- name: Bootstrap a brand-new Galera cluster on this node
+  ansible.builtin.systemd:
+    name: mysql@bootstrap.service
+    state: started
+  when: do_bootstrap
+
+- name: Ensure the plain "mysql" unit is enabled for future boots after bootstrap
+  ansible.builtin.systemd:
+    name: mysql
+    enabled: true
+  when: do_bootstrap
+
+- name: Start MySQL and join the existing cluster via IST/SST
+  ansible.builtin.systemd:
+    name: mysql
+    enabled: true
+    state: started
+  when: not do_bootstrap
+
+- name: Wait for this node's wsrep state to report Synced
+  community.mysql.mysql_query:
+    login_user: root
+    login_password: "{{ mysql_root_pass }}"
+    login_unix_socket: "{{ mysql_socket }}"
+    query: "SHOW STATUS LIKE 'wsrep_local_state_comment'"
+  register: wsrep_state
+  until: >
+    wsrep_state is succeeded and
+    wsrep_state.query_result[0] is defined and
+    wsrep_state.query_result[0][0].Value == 'Synced'
+  retries: "{{ wsrep_sync_wait_retries }}"
+  delay: "{{ wsrep_sync_wait_delay }}"
+
+- name: Report this node's wsrep state
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} is wsrep state: {{ wsrep_state.query_result[0][0].Value }}"
+
+- name: Create the SST, health-check, and application accounts (bootstrap node only — Galera replicates them cluster-wide)
+  when: inventory_hostname == groups['db_nodes'][0]
+  block:
+    - name: Create the SST user (both localhost and 127.0.0.1 — Percona's packaged
+        SST script's exact connection method varies by version)
+      community.mysql.mysql_user:
+        login_user: root
+        login_password: "{{ mysql_root_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        name: "{{ sst_user }}"
+        host: "{{ item }}"
+        password: "{{ sst_password }}"
+        priv: "*.*:RELOAD,LOCK TABLES,PROCESS,REPLICATION CLIENT,BACKUP_ADMIN"
+        state: present
+      loop:
+        - localhost
+        - 127.0.0.1
+
+    - name: Create the health-check user (both localhost and 127.0.0.1 — clustercheck
+        runs locally on each DB node, but its exact connection method varies by version)
+      community.mysql.mysql_user:
+        login_user: root
+        login_password: "{{ mysql_root_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        name: "{{ health_user }}"
+        host: "{{ item }}"
+        password: "{{ health_pass }}"
+        priv: "*.*:PROCESS,REPLICATION CLIENT"
+        state: present
+      loop:
+        - localhost
+        - 127.0.0.1
+
+    - name: Create the application database
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "{{ mysql_root_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        name: "{{ app_db }}"
+        state: present
+
+    - name: Create the application user, reachable from proxy and DB node IPs
+      community.mysql.mysql_user:
+        login_user: root
+        login_password: "{{ mysql_root_pass }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        name: "{{ app_db_user }}"
+        host: "{{ hostvars[item].ansible_host }}"
+        password: "{{ app_db_pass }}"
+        priv: "{{ app_db }}.*:ALL"
+        state: present
+      loop: "{{ groups['proxy_nodes'] + groups['db_nodes'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+- name: Install xinetd for the clustercheck health-check listener
+  ansible.builtin.apt:
+    name: xinetd
+    state: present
+
+- name: Write the clustercheck xinetd service definition
+  # HAProxy (on the proxy nodes) httpchk's this port on each DB node instead
+  # of querying wsrep status itself. clustercheck reports DOWN while this
+  # node is an SST donor or not yet Synced, so HAProxy never routes traffic
+  # to a mid-sync node.
+  ansible.builtin.template:
+    src: xinetd_mysqlchk.j2
+    dest: /etc/xinetd.d/mysqlchk
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart xinetd
+
+- name: Flush handlers so xinetd picks up the new service immediately
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start xinetd
+  ansible.builtin.systemd:
+    name: xinetd
+    enabled: true
+    state: started
+
+- name: Wait for the clustercheck endpoint to respond
+  ansible.builtin.wait_for:
+    port: "{{ clustercheck_port }}"
+    host: 127.0.0.1
+    timeout: 15

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# XtraBackup integrity check — managed by Ansible (role: xtrabackup)
+#
+# Verifies the most recent backup (full or diff) actually completed
+# successfully and isn't stale.
+set -uo pipefail
+
+ALERT="{{ xtrabackup_scripts_dir }}/alert.sh"
+BACKUP_ROOT="{{ xtrabackup_repo_path }}"
+
+LATEST=$(find "${BACKUP_ROOT}" -maxdepth 1 \( -name 'full-*' -o -name 'diff-*' \) -type d | sort | tail -1)
+if [[ -z "${LATEST}" ]]; then
+    "${ALERT}" "xtrabackup check FAILED: no backups found under ${BACKUP_ROOT}"
+    exit 1
+fi
+
+if [[ ! -f "${LATEST}/xtrabackup_checkpoints" ]]; then
+    "${ALERT}" "xtrabackup check FAILED: ${LATEST} is missing xtrabackup_checkpoints (incomplete backup)"
+    exit 1
+fi
+
+AGE_HOURS=$(( ( $(date +%s) - $(stat -c %Y "${LATEST}/xtrabackup_checkpoints") ) / 3600 ))
+if (( AGE_HOURS > {{ xtrabackup_backup_freshness_hours }} )); then
+    "${ALERT}" "xtrabackup check FAILED: most recent backup (${LATEST}) is ${AGE_HOURS}h old"
+    exit 1
+fi

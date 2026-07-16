@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Shared alert notifier — managed by Ansible (role: xtrabackup)
+# Usage: alert.sh "<message>"
+#
+# POSTs a JSON payload to a Slack/Discord-style incoming webhook. Slack
+# expects the message under "text"; Discord expects "content" — set via
+# alert_webhook_payload_key in group_vars. Teams needs a fuller adaptive-card
+# payload and isn't supported by this simple helper.
+set -uo pipefail
+
+MESSAGE="${1:?usage: alert.sh <message>}"
+HOST=$(hostname -s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+FULL_MESSAGE="[${TIMESTAMP}] ${HOST}: ${MESSAGE}"
+
+logger -t mysql-ha-alert "${FULL_MESSAGE}"
+
+PAYLOAD=$(jq -n --arg key "{{ alert_webhook_payload_key }}" --arg msg "${FULL_MESSAGE}" '{($key): $msg}')
+
+curl -fsS -X POST -H 'Content-Type: application/json' -d "${PAYLOAD}" "{{ alert_webhook_url }}" >/dev/null \
+    || logger -t mysql-ha-alert "WARNING: failed to deliver alert webhook"

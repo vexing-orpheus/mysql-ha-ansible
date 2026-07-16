@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Keepalived VRRP health check — managed by Ansible (role: haproxy_keepalived)
 HAPROXY_STATS_PORT="{{ haproxy_stats_port }}"
-PGBOUNCER_PORT="{{ pgbouncer_port }}"
 HAPROXY_STATS_USER="{{ haproxy_stats_user }}"
 HAPROXY_STATS_PASS="{{ haproxy_stats_pass }}"
 
@@ -15,14 +14,6 @@ HTTP_CODE=$(curl -sf --max-time 3 \
     -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
 if [[ "${HTTP_CODE}" != "200" ]]; then
     echo "FAIL: haproxy stats not responding (HTTP ${HTTP_CODE})" >&2; exit 1
-fi
-
-if ! pgrep -x pgbouncer >/dev/null 2>&1; then
-    echo "FAIL: pgbouncer process not running" >&2; exit 1
-fi
-
-if ! ss -tlnp | grep -q ":${PGBOUNCER_PORT}"; then
-    echo "FAIL: pgbouncer not listening on port ${PGBOUNCER_PORT}" >&2; exit 1
 fi
 
 exit 0

@@ -1,0 +1,17 @@
+---
+- name: reload systemd for mysql
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart mysql
+  # Safe because this role's play runs with serial: 1 (see install.yml) — only
+  # one DB node is ever mid-restart at a time, so the other two always retain
+  # Galera quorum (2 of 3) while it rejoins via IST/SST.
+  ansible.builtin.systemd:
+    name: mysql
+    state: restarted
+
+- name: restart xinetd
+  ansible.builtin.systemd:
+    name: xinetd
+    state: restarted

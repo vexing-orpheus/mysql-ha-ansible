@@ -19,7 +19,7 @@ vrrp_script chk_proxy_services {
     weight       -20
 }
 
-vrrp_instance VI_PG_CLUSTER {
+vrrp_instance VI_MYSQL_CLUSTER {
     state             {{ vrrp_role }}
     interface          {{ vip_interface }}
     virtual_router_id {{ vrrp_router_id }}
@@ -52,7 +52,7 @@ vrrp_instance VI_PG_CLUSTER {
         chk_proxy_services
     }
 
-    notify_master  "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_PG_CLUSTER MASTER"
-    notify_backup  "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_PG_CLUSTER BACKUP"
-    notify_fault   "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_PG_CLUSTER FAULT"
+    notify_master  "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_MYSQL_CLUSTER MASTER"
+    notify_backup  "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_MYSQL_CLUSTER BACKUP"
+    notify_fault   "{{ haproxy_keepalived_scripts_dir }}/notify.sh INSTANCE VI_MYSQL_CLUSTER FAULT"
 }

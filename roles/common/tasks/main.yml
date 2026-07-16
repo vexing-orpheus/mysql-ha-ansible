@@ -1,7 +1,7 @@
 ---
 # =============================================================================
 # common — OS prep shared by every node: packages, NTP, hosts file, kernel
-# tuning, THP, firewall, PGDG repo. x86_64 only.
+# tuning, THP, firewall, Percona repo. x86_64 only.
 # =============================================================================
 
 - name: Fail fast on non-x86_64 hosts
@@ -58,29 +58,29 @@
   block:
     - name: Start from the OS root volume as the fallback data-directory mount
       ansible.builtin.set_fact:
-        pg_data_mount: "{{ root_mount }}"
+        mysql_data_mount: "{{ root_mount }}"
 
-    - name: Find the most specific mount point backing the PostgreSQL data directory
+    - name: Find the most specific mount point backing the MySQL data directory
       ansible.builtin.set_fact:
-        pg_data_mount: "{{ item }}"
+        mysql_data_mount: "{{ item }}"
       loop: "{{ ansible_mounts }}"
       loop_control:
         label: "{{ item.mount }}"
       when: >-
-        (item.mount == pg_data_dir or
-         pg_data_dir.startswith(item.mount.rstrip('/') + '/')) and
-        item.mount | length > pg_data_mount.mount | length
+        (item.mount == mysql_data_dir or
+         mysql_data_dir.startswith(item.mount.rstrip('/') + '/')) and
+        item.mount | length > mysql_data_mount.mount | length
 
     - name: Warn if the data directory shares a device with the OS volume
       ansible.builtin.debug:
         msg: >-
           RECOMMENDATION: {{ inventory_hostname }}: no dedicated data volume
-          detected for {{ pg_data_dir }} — it resolves to the same device
-          ({{ pg_data_mount.device }}) as the OS root volume ({{ root_mount.mount }}).
-          For production use, mount {{ pg_data_dir }} (or a parent directory,
-          e.g. /var/lib/postgresql) on its own volume, separate from the OS
-          disk, so backups/WAL growth can't fill the root filesystem.
-      when: pg_data_mount.device == root_mount.device
+          detected for {{ mysql_data_dir }} — it resolves to the same device
+          ({{ mysql_data_mount.device }}) as the OS root volume ({{ root_mount.mount }}).
+          For production use, mount {{ mysql_data_dir }} (or a parent directory,
+          e.g. /var/lib/mysql) on its own volume, separate from the OS disk,
+          so backups/binlog growth can't fill the root filesystem.
+      when: mysql_data_mount.device == root_mount.device
 
 - name: Update apt cache and upgrade packages
   ansible.builtin.apt:
@@ -117,15 +117,15 @@
 - name: Wait for chrony to synchronize the system clock
   # Starting chrony doesn't wait for it to actually correct the clock — on a
   # freshly booted/cloned VM with a skewed hardware clock, apt's signed repo
-  # metadata (PGDG below) can fail with "Release file ... is not valid yet"
-  # if we touch it before the clock is fixed.
+  # metadata (Percona repo below) can fail with "Release file ... is not
+  # valid yet" if we touch it before the clock is fixed.
   ansible.builtin.command: chronyc waitsync 30 1 0 2
   changed_when: false
 
 - name: Populate /etc/hosts with cluster node entries
   ansible.builtin.blockinfile:
     path: /etc/hosts
-    marker: "## {mark} PG-HA-CLUSTER"
+    marker: "## {mark} MYSQL-HA-CLUSTER"
     block: |
       {% for host in groups['db_nodes'] %}
       {{ hostvars[host].ansible_host }}    {{ host }}
@@ -133,21 +133,21 @@
       {% for host in groups['proxy_nodes'] %}
       {{ hostvars[host].ansible_host }} {{ host }}
       {% endfor %}
-      {{ cluster_vip }}    pg-cluster-vip
+      {{ cluster_vip }}    mysql-cluster-vip
 
-- name: Write sysctl tuning for PostgreSQL HA
+- name: Write sysctl tuning for MySQL HA
   ansible.builtin.template:
-    src: 90-pg-ha-cluster.conf.j2
-    dest: /etc/sysctl.d/90-pg-ha-cluster.conf
+    src: 90-mysql-ha-cluster.conf.j2
+    dest: /etc/sysctl.d/90-mysql-ha-cluster.conf
     owner: root
     group: root
     mode: "0644"
   notify: apply sysctl
 
-- name: Write ulimits for postgres/root
+- name: Write ulimits for mysql/root
   ansible.builtin.template:
-    src: 90-pg-ha-cluster.limits.conf.j2
-    dest: /etc/security/limits.d/90-pg-ha-cluster.conf
+    src: 90-mysql-ha-cluster.limits.conf.j2
+    dest: /etc/security/limits.d/90-mysql-ha-cluster.conf
     owner: root
     group: root
     mode: "0644"
@@ -170,22 +170,35 @@
     mode: "0644"
   notify: reload systemd and enable cpu governor service
 
-- name: Add PGDG apt repository (key + repo in one deb822 source)
-  ansible.builtin.deb822_repository:
-    name: pgdg
-    types: deb
-    uris: https://apt.postgresql.org/pub/repos/apt
-    suites: "{{ ansible_distribution_release }}-pgdg"
-    components: main
-    architectures: amd64
-    signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
-    state: present
-  register: pgdg_repo_added
+- name: Check whether percona-release is already installed
+  ansible.builtin.command: dpkg-query -W -f='${Status}' percona-release
+  register: percona_release_check
+  changed_when: false
+  failed_when: false
 
-- name: Refresh apt cache after adding PGDG repo
+- name: Download percona-release repository package
+  ansible.builtin.get_url:
+    url: "https://repo.percona.com/apt/percona-release_latest.{{ ansible_distribution_release }}_all.deb"
+    dest: /tmp/percona-release_latest.deb
+    mode: "0644"
+  when: "'install ok installed' not in percona_release_check.stdout"
+
+- name: Install percona-release repository package
+  ansible.builtin.apt:
+    deb: /tmp/percona-release_latest.deb
+    state: present
+  when: "'install ok installed' not in percona_release_check.stdout"
+  register: percona_release_installed
+
+- name: Enable the Percona XtraDB Cluster product repo
+  ansible.builtin.command: percona-release setup -y {{ percona_product_series }}
+  register: percona_repo_setup
+  changed_when: "'exiting' not in percona_repo_setup.stdout"
+
+- name: Refresh apt cache after enabling the Percona repo
   ansible.builtin.apt:
     update_cache: true
-  when: pgdg_repo_added.changed
+  when: percona_release_installed.changed or percona_repo_setup.changed
 
 - name: Reset UFW to known defaults
   community.general.ufw:
@@ -207,55 +220,54 @@
     rule: allow
     name: OpenSSH
 
-- name: UFW — DB node rules (Postgres, Patroni REST, etcd)
+- name: UFW — DB node rules (MySQL, Galera replication/IST/SST)
   when: inventory_hostname in groups['db_nodes']
   block:
-    - name: Allow Postgres from every DB and proxy node
+    - name: Allow MySQL from every DB and proxy node
       community.general.ufw:
         rule: allow
         proto: tcp
         from_ip: "{{ hostvars[item].ansible_host }}"
-        to_port: "{{ pg_port | string }}"
+        to_port: "{{ mysql_port | string }}"
       loop: "{{ groups['db_nodes'] + groups['proxy_nodes'] }}"
 
-    - name: Allow Patroni REST API from proxy nodes
+    - name: Allow Galera replication traffic (gcomm, tcp+udp) between DB nodes
+      community.general.ufw:
+        rule: allow
+        proto: "{{ item.1 }}"
+        from_ip: "{{ hostvars[item.0].ansible_host }}"
+        to_port: "{{ galera_replication_port | string }}"
+      loop: "{{ groups['db_nodes'] | product(['tcp', 'udp']) | list }}"
+      loop_control:
+        label: "{{ item.0 }}/{{ item.1 }}"
+
+    - name: Allow Galera IST traffic between DB nodes
       community.general.ufw:
         rule: allow
         proto: tcp
         from_ip: "{{ hostvars[item].ansible_host }}"
-        to_port: "{{ patroni_api_port | string }}"
+        to_port: "{{ galera_ist_port | string }}"
+      loop: "{{ groups['db_nodes'] }}"
+
+    - name: Allow Galera SST traffic between DB nodes
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ hostvars[item].ansible_host }}"
+        to_port: "{{ galera_sst_port | string }}"
+      loop: "{{ groups['db_nodes'] }}"
+
+    - name: Allow the clustercheck health endpoint from proxy nodes
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ hostvars[item].ansible_host }}"
+        to_port: "{{ clustercheck_port | string }}"
       loop: "{{ groups['proxy_nodes'] }}"
 
-    - name: Allow etcd client/peer traffic between DB nodes
-      community.general.ufw:
-        rule: allow
-        proto: tcp
-        from_ip: "{{ hostvars[item].ansible_host }}"
-        to_port: "{{ port | string }}"
-      loop: "{{ groups['db_nodes'] }}"
-      loop_control:
-        loop_var: item
-      vars:
-        port: "{{ etcd_client_port }}"
-
-    - name: Allow etcd peer traffic between DB nodes
-      community.general.ufw:
-        rule: allow
-        proto: tcp
-        from_ip: "{{ hostvars[item].ansible_host }}"
-        to_port: "{{ etcd_peer_port | string }}"
-      loop: "{{ groups['db_nodes'] }}"
-
-- name: UFW — proxy node rules (PgBouncer, HAProxy, VRRP)
+- name: UFW — proxy node rules (HAProxy, VRRP)
   when: inventory_hostname in groups['proxy_nodes']
   block:
-    - name: Allow PgBouncer from app network
-      community.general.ufw:
-        rule: allow
-        proto: tcp
-        from_ip: "{{ app_network }}"
-        to_port: "{{ pgbouncer_port | string }}"
-
     - name: Allow HAProxy write/read from app network
       community.general.ufw:
         rule: allow

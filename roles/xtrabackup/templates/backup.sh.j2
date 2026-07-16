@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# XtraBackup wrapper — managed by Ansible (role: xtrabackup)
+# Usage: backup.sh <full|diff>
+#
+# Runs only on the fixed xtrabackup_backup_node (see tasks/main.yml) — every
+# Galera node holds identical data, so there's no floating-primary role to
+# chase.
+set -uo pipefail
+
+BACKUP_TYPE="${1:?usage: backup.sh <full|diff>}"
+ALERT="{{ xtrabackup_scripts_dir }}/alert.sh"
+BACKUP_ROOT="{{ xtrabackup_repo_path }}"
+LOG="{{ xtrabackup_log_path }}/backup.log"
+TS=$(date +%Y%m%d_%H%M%S)
+
+LATEST_FULL=$(find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d | sort | tail -1)
+
+if [[ "${BACKUP_TYPE}" == "full" ]]; then
+    TARGET="${BACKUP_ROOT}/full-${TS}"
+    xtrabackup --backup --target-dir="${TARGET}" \
+        --defaults-extra-file=/root/.my.cnf --user=root \
+        --compress --compress-threads=2 \
+        >>"${LOG}" 2>&1
+    RC=$?
+else
+    if [[ -z "${LATEST_FULL}" ]]; then
+        "${ALERT}" "xtrabackup diff backup FAILED on $(hostname -s): no prior full backup to diff against"
+        exit 1
+    fi
+    TARGET="${BACKUP_ROOT}/diff-${TS}"
+    xtrabackup --backup --target-dir="${TARGET}" --incremental-basedir="${LATEST_FULL}" \
+        --defaults-extra-file=/root/.my.cnf --user=root \
+        --compress --compress-threads=2 \
+        >>"${LOG}" 2>&1
+    RC=$?
+fi
+
+if [[ ${RC} -ne 0 ]] || ! tail -5 "${LOG}" | grep -q 'completed OK!'; then
+    "${ALERT}" "xtrabackup ${BACKUP_TYPE} backup FAILED on $(hostname -s) — see ${LOG}"
+    exit 1
+fi
+
+# Retention: keep the last {{ xtrabackup_retention_full }} full backup sets
+# (each full-* dir plus the diff-* dirs taken against it).
+KEEP={{ xtrabackup_retention_full }}
+OLDEST_KEPT_FULL=$(find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d | sort | tail -n "${KEEP}" | head -1)
+if [[ -n "${OLDEST_KEPT_FULL}" ]]; then
+    find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d ! -newer "${OLDEST_KEPT_FULL}" ! -path "${OLDEST_KEPT_FULL}" -exec rm -rf {} +
+    find "${BACKUP_ROOT}" -maxdepth 1 -name 'diff-*' -type d -not -newer "${OLDEST_KEPT_FULL}" -exec rm -rf {} +
+fi

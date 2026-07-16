@@ -1,4 +1,0 @@
----
-etcd_data_dir: /var/lib/etcd
-etcd_health_retries: 30
-etcd_health_delay: 2
