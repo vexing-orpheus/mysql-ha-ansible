@@ -183,6 +183,22 @@ checks Patroni's role via its REST API first: backup/check exit immediately
 unless the node is currently the leader; restore-verify exits immediately
 *unless* it's a replica, so it never competes with the primary for I/O.
 
+**Retention** (`roles/pgbackrest/defaults/main.yml`, overridable):
+- `pgbackrest_retention_full: 4` — keeps the last 4 full backups.
+- `pgbackrest_retention_diff: 2` — keeps diff backups for the last 2 full-backup cycles.
+
+With full backups weekly, that's roughly **4 weeks of backup history** on
+whichever node is taking backups, with daily diffs giving same-day recovery
+granularity within that window. Pruning happens automatically — `pgbackrest
+backup` runs `expire` after every successful backup, so old backups age out
+as new ones land. Because the repo is local per node (see above), pruning
+only happens on whichever node is *currently* primary: a former primary's
+old backup chain isn't actively pruned once it stops taking backups, since
+`backup.sh` only runs on the leader — it'll just sit on disk until that node
+becomes primary again. Override either value in `group_vars/all/01-vars.yml`
+if you want a longer/shorter window, e.g. `pgbackrest_retention_full: 8` for
+~2 months.
+
 **Restore verification** actually proves a backup is usable, not just
 present: it restores the latest backup into a scratch directory
 (`pgbackrest_restore_verify_path`), boots a temporary Postgres instance on a
