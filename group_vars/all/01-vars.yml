@@ -27,6 +27,16 @@ galera_cluster_name: mysql-ha-cluster
 
 # ── MySQL / Percona XtraDB Cluster ───────────────────────────────────────
 percona_product_series: pxc80                # Percona repo series — override with -e for a different major version
+# percona-release detects the OS purely via `lsb_release -sc` and has no
+# override flag; it decides support by probing repo.percona.com for a
+# dists/<codename>/ directory. Percona has not published that directory at
+# all for this fleet's actual codename, so the common role always shims
+# lsb_release to report this codename instead when running
+# `percona-release setup`/`enable`, rather than probing the real one first.
+# Once Percona ships repos for the fleet's actual codename, drop the shim
+# tasks in common/tasks/main.yml (or point this at the real codename) —
+# override with -e in the meantime for a different fallback.
+percona_release_os_codename_fallback: noble
 mysql_port:        3306
 mysql_data_dir:    /var/lib/mysql
 mysql_log_dir:     /var/log/mysql

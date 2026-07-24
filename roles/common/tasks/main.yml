@@ -82,17 +82,6 @@
           so backups/binlog growth can't fill the root filesystem.
       when: mysql_data_mount.device == root_mount.device
 
-- name: Update apt cache and upgrade packages
-  ansible.builtin.apt:
-    update_cache: true
-    upgrade: safe
-    cache_valid_time: 3600
-
-- name: Install base packages
-  ansible.builtin.apt:
-    name: "{{ common_packages }}"
-    state: present
-
 - name: Configure chrony
   ansible.builtin.template:
     src: chrony.conf.j2
@@ -117,10 +106,22 @@
 - name: Wait for chrony to synchronize the system clock
   # Starting chrony doesn't wait for it to actually correct the clock — on a
   # freshly booted/cloned VM with a skewed hardware clock, apt's signed repo
-  # metadata (Percona repo below) can fail with "Release file ... is not
-  # valid yet" if we touch it before the clock is fixed.
+  # metadata (both the base Ubuntu repos below and the Percona repo further
+  # down) can fail with "Release file ... is not valid yet" if we touch it
+  # before the clock is fixed. This must run before any apt cache update.
   ansible.builtin.command: chronyc waitsync 30 1 0 2
   changed_when: false
+
+- name: Update apt cache and upgrade packages
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: safe
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
 
 - name: Populate /etc/hosts with cluster node entries
   ansible.builtin.blockinfile:
@@ -190,15 +191,59 @@
   when: "'install ok installed' not in percona_release_check.stdout"
   register: percona_release_installed
 
+- name: Create a temp dir for the lsb_release shim
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: percona-release-shim.
+  register: percona_shim_dir
+
+- name: Write an lsb_release shim reporting a Percona-supported codename
+  ansible.builtin.copy:
+    dest: "{{ percona_shim_dir.path }}/lsb_release"
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      if [ "$1" = "-sc" ]; then
+        echo "{{ percona_release_os_codename_fallback }}"
+      else
+        exec /usr/bin/lsb_release "$@"
+      fi
+
 - name: Enable the Percona XtraDB Cluster product repo
+  # percona-release derives the apt codename solely from `lsb_release -sc`
+  # and decides OS support by probing repo.percona.com/<repo>/apt/dists/
+  # <codename>/. Percona has not published that directory for this fleet's
+  # OS codename at all, so the real codename always fails here; we always
+  # pin lsb_release's answer to a codename Percona does publish instead of
+  # probing first. See percona_release_os_codename_fallback in group_vars
+  # for how/when to move off this.
   ansible.builtin.command: percona-release setup -y {{ percona_product_series }}
+  environment:
+    PATH: "{{ percona_shim_dir.path }}:{{ ansible_env.PATH }}"
   register: percona_repo_setup
   changed_when: "'exiting' not in percona_repo_setup.stdout"
+
+- name: Enable the Percona Tools repository (for XtraBackup/qpress)
+  # percona-xtrabackup-80 is not part of the pxc-80 repo `setup` enables
+  # above — it lives in the separate "tools" component, which needs its own
+  # explicit enable.
+  ansible.builtin.command: percona-release enable tools release
+  environment:
+    PATH: "{{ percona_shim_dir.path }}:{{ ansible_env.PATH }}"
+  register: percona_tools_repo_setup
+  changed_when: "'exiting' not in percona_tools_repo_setup.stdout"
+
+- name: Remove the lsb_release shim
+  ansible.builtin.file:
+    path: "{{ percona_shim_dir.path }}"
+    state: absent
 
 - name: Refresh apt cache after enabling the Percona repo
   ansible.builtin.apt:
     update_cache: true
-  when: percona_release_installed.changed or percona_repo_setup.changed
+  when: >-
+    percona_release_installed.changed or percona_repo_setup.changed or
+    percona_tools_repo_setup.changed
 
 - name: Reset UFW to known defaults
   community.general.ufw:
