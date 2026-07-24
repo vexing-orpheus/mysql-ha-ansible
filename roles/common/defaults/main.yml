@@ -34,7 +34,7 @@ fs_file_max: 1048576
 min_cpu_vcpus: 4
 min_ram_mb: 11800         # ~12GB; leaves headroom for firmware/hypervisor-reserved memory.
                           # Higher than a bare "8GB is enough for a database" floor because
-                          # InnoDB's buffer pool takes ~70% of RAM (vs. ~25% for Postgres's
+                          # InnoDB's buffer pool takes ~55% of RAM (vs. ~25% for Postgres's
                           # shared_buffers), and Galera's gcache adds a further fixed ~1GB
                           # on top of that — see innodb_buffer_pool_pct / galera_gcache_size_mb
                           # in group_vars/all/01-vars.yml.

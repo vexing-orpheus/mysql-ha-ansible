@@ -52,6 +52,5 @@ wsrep_provider_options = "gcache.size={{ galera_gcache_size_mb }}M; gcs.fc_limit
 wsrep_slave_threads                  = {{ ansible_processor_vcpus | default(ansible_processor_count) }}
 
 wsrep_sst_method                   = xtrabackup-v2
-wsrep_sst_auth                      = {{ sst_user }}:{{ sst_password }}
 
 pxc_strict_mode                      = ENFORCING

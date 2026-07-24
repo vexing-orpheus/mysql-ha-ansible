@@ -20,30 +20,6 @@
     state: present
   register: pxc_install
 
-- name: Wait for the freshly installed MySQL service to accept local connections
-  ansible.builtin.wait_for:
-    path: "{{ mysql_socket }}"
-    timeout: 60
-
-- name: Set the MySQL root password (idempotent — falls back to passwordless local auth on first run)
-  community.mysql.mysql_user:
-    name: root
-    host: localhost
-    password: "{{ mysql_root_pass }}"
-    login_user: root
-    login_password: "{{ mysql_root_pass }}"
-    check_implicit_admin: true
-    login_unix_socket: "{{ mysql_socket }}"
-    state: present
-
-- name: Write root's .my.cnf for passwordless local admin access
-  ansible.builtin.template:
-    src: root_my.cnf.j2
-    dest: /root/.my.cnf
-    owner: root
-    group: root
-    mode: "0600"
-
 - name: Read total memory and compute InnoDB buffer pool sizing
   ansible.builtin.set_fact:
     innodb_buffer_pool_mb: "{{ [((ansible_memtotal_mb | int) * innodb_buffer_pool_pct // 100), 512] | max }}"
@@ -95,6 +71,12 @@
     mode: "0644"
 
 - name: Stop MySQL before applying Galera configuration
+  # The package's postinst already started mysqld once (as a temporary,
+  # single-node bootstrap) to run its own first-boot initialization, then
+  # deliberately shut it down again — `systemctl status mysql` reads
+  # "inactive (dead)" right after install by design. This stop is a no-op in
+  # that case and only matters as a safety net if a previous run of this
+  # role left mysqld running under a config we're about to replace.
   ansible.builtin.systemd:
     name: mysql
     state: stopped
@@ -110,7 +92,14 @@
   loop_control:
     label: "{{ item }}"
   when: item != inventory_hostname
-  failed_when: false
+  # ignore_errors (not failed_when: false) — failed_when overwrites the
+  # registered result's `failed` key with its own evaluation, which would
+  # make every entry read failed:false regardless of whether the peer was
+  # actually reachable, and the rejectattr('failed') filter below would then
+  # count every peer as "reachable" unconditionally. ignore_errors just
+  # stops this from aborting the play while leaving the genuine pass/fail
+  # status intact for that filter to read.
+  ignore_errors: true
   changed_when: false
 
 - name: Determine whether a cluster is already reachable on any peer
@@ -168,6 +157,30 @@
     enabled: true
     state: started
   when: not do_bootstrap
+
+- name: Wait for MySQL to accept local connections
+  ansible.builtin.wait_for:
+    path: "{{ mysql_socket }}"
+    timeout: 60
+
+- name: Set the MySQL root password (idempotent — falls back to passwordless local auth on first run)
+  community.mysql.mysql_user:
+    name: root
+    host: localhost
+    password: "{{ mysql_root_pass }}"
+    login_user: root
+    login_password: "{{ mysql_root_pass }}"
+    check_implicit_admin: true
+    login_unix_socket: "{{ mysql_socket }}"
+    state: present
+
+- name: Write root's .my.cnf for passwordless local admin access
+  ansible.builtin.template:
+    src: root_my.cnf.j2
+    dest: /root/.my.cnf
+    owner: root
+    group: root
+    mode: "0600"
 
 - name: Wait for this node's wsrep state to report Synced
   community.mysql.mysql_query:

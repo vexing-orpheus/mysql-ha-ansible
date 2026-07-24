@@ -8,6 +8,7 @@
 service mysqlchk
 {
     disable         = no
+    type            = UNLISTED
     flags           = REUSE
     socket_type     = stream
     port            = {{ clustercheck_port }}

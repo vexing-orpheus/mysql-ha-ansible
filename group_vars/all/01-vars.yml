@@ -44,7 +44,13 @@ mysql_socket:      /var/run/mysqld/mysqld.sock
 
 # Auto-sized at role runtime from ansible_memtotal_mb; override to pin.
 # innodb_buffer_pool_size_override: 8G
-innodb_buffer_pool_pct: 70                   # % of RAM given to InnoDB's buffer pool
+# 55%, not the more common 70-80%, because this fleet runs under strict
+# memory overcommit (vm.overcommit_memory=2): the buffer pool + gcache are
+# reserved virtual memory that counts fully against CommitLimit, and at 70%
+# a 15-16GB node left well under 200MB of commit headroom — enough for
+# mysqld itself, but not for SSH/Ansible's own subprocess forks to manage
+# the box afterward. 55% leaves several GB of headroom instead.
+innodb_buffer_pool_pct: 55                   # % of RAM given to InnoDB's buffer pool
 galera_gcache_size_mb:  1024                 # Galera write-set cache (gcache.size)
 
 # Ceiling for well-provisioned nodes — roles/mysql_galera scales this down on

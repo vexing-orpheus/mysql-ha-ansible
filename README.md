@@ -37,9 +37,13 @@ of every run — the play fails fast on any node that doesn't meet these:
 - **CPU**: 4 vCPUs (8+ recommended for DB nodes — warns, doesn't fail, if unmet)
 - **RAM**: 12 GB (16 GB+ recommended for DB nodes — warns, doesn't fail, if
   unmet). Higher than a generic "8GB is enough for a database" floor because
-  InnoDB's buffer pool takes ~70% of RAM by default (`innodb_buffer_pool_pct`)
+  InnoDB's buffer pool takes ~55% of RAM by default (`innodb_buffer_pool_pct`)
   and Galera's gcache adds a further fixed ~1GB on top of that — see
-  "Memory-based tuning" below.
+  "Memory-based tuning" below. The percentage is kept well under the more
+  common 70-80% because these are reserved, not lazily-grown, and on a host
+  with strict memory overcommit (`vm.overcommit_memory=2`) a too-large
+  reservation can leave too little commit headroom for anything else on the
+  box, including SSH/Ansible's own management access.
 - **Disk**: 50 GB OS volume. A separate data volume for DB nodes, mounted
   under the MySQL data directory (or a parent of it, e.g. `/var/lib/mysql`),
   is recommended but not required — DB nodes warn, not fail, if the data
