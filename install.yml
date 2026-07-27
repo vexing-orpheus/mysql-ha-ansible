@@ -126,6 +126,13 @@
 - name: OS preparation — every node
   hosts: mysql_ha_cluster
   become: true
+  # lock_timeout: on a freshly booted/restored VM, cloud-init's
+  # unattended-upgrades can be mid-run and holding /var/lib/dpkg/lock-frontend
+  # when our first apt task fires; without this, ansible.builtin.apt fails
+  # immediately instead of waiting for it to finish.
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 300
   roles:
     - common
 
@@ -133,18 +140,27 @@
   hosts: db_nodes
   become: true
   serial: 1
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 300
   roles:
     - mysql_galera
 
 - name: Backups, integrity check, restore verification — DB nodes
   hosts: db_nodes
   become: true
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 300
   roles:
     - xtrabackup
 
 - name: Connection routing and load balancing — proxy nodes
   hosts: proxy_nodes
   become: true
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 300
   roles:
     - haproxy_keepalived
 
