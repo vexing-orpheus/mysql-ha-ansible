@@ -85,9 +85,16 @@
         resolved_ssh_user: "{{ ssh_user | default(p_ssh_user.user_input | default('', true)) }}"
         resolved_ssh_pass: "{{ ssh_pass | default(p_ssh_pass.user_input | default('', true)) }}"
         resolved_health_user: "{{ health_user | default(p_health_user.user_input | default('clustercheck', true)) }}"
-        resolved_health_pass: "{{ health_pass | default(p_health_pass.user_input | default('', true)) }}"
+        # 'iforgottoaddapassword' fallback matches install.yml's credential
+        # play (see the same literal there) — these two are real DB/HAProxy
+        # account passwords, not "blank means something else" fields like
+        # resolved_ssh_pass (blank = use SSH keys) or resolved_alert_webhook_url
+        # (blank = alerts disabled), so blank here must resolve the same way
+        # it does when the account was first created, not to a bare empty
+        # string that just fails auth outright.
+        resolved_health_pass: "{{ health_pass | default(p_health_pass.user_input | default('iforgottoaddapassword', true)) }}"
         resolved_haproxy_stats_user: "{{ haproxy_stats_user | default(p_haproxy_stats_user.user_input | default('haproxyadmin', true)) }}"
-        resolved_haproxy_stats_pass: "{{ haproxy_stats_pass | default(p_haproxy_stats_pass.user_input | default('', true)) }}"
+        resolved_haproxy_stats_pass: "{{ haproxy_stats_pass | default(p_haproxy_stats_pass.user_input | default('iforgottoaddapassword', true)) }}"
         resolved_alert_webhook_url: "{{ alert_webhook_url | default(p_alert_webhook_url.user_input | default('', true)) }}"
         resolved_cluster_vip: "{{ cluster_vip | default(p_cluster_vip.user_input | default('10.223.16.79', true)) }}"
       when: standalone_run
@@ -143,7 +150,7 @@
         login_unix_socket: "{{ mysql_socket }}"
         query: "SHOW STATUS LIKE 'wsrep_local_state_comment'"
       register: wsrep_local_state
-      failed_when: false
+      ignore_errors: true
 
     - name: Query wsrep cluster status (Primary component membership)
       community.mysql.mysql_query:
@@ -152,7 +159,7 @@
         login_unix_socket: "{{ mysql_socket }}"
         query: "SHOW STATUS LIKE 'wsrep_cluster_status'"
       register: wsrep_cluster_status
-      failed_when: false
+      ignore_errors: true
 
     - name: Query wsrep cluster size (as seen by this node)
       community.mysql.mysql_query:
@@ -161,7 +168,7 @@
         login_unix_socket: "{{ mysql_socket }}"
         query: "SHOW STATUS LIKE 'wsrep_cluster_size'"
       register: wsrep_cluster_size
-      failed_when: false
+      ignore_errors: true
 
     - name: Query wsrep ready flag
       community.mysql.mysql_query:
@@ -170,7 +177,7 @@
         login_unix_socket: "{{ mysql_socket }}"
         query: "SHOW STATUS LIKE 'wsrep_ready'"
       register: wsrep_ready
-      failed_when: false
+      ignore_errors: true
 
     - name: Set per-node wsrep facts (for the control node to aggregate)
       ansible.builtin.set_fact:
@@ -185,6 +192,24 @@
           {{ inventory_hostname }}: state={{ node_state }},
           cluster_status={{ node_cluster_status }},
           cluster_size={{ node_cluster_size }}, ready={{ node_ready }}
+
+    - name: Report the underlying query error, if any of the wsrep queries failed
+      # With ignore_errors: true (not failed_when: false — same reasoning as
+      # mysql_galera/tasks/main.yml's peer-liveness check) the registered
+      # results keep their real failed/msg values, so a bad health_user
+      # password or an actually-unreachable node shows its real cause here
+      # instead of every node just reading "UNREACHABLE" with no explanation.
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ [wsrep_local_state, wsrep_cluster_status, wsrep_cluster_size, wsrep_ready]
+             | selectattr('failed', 'defined') | selectattr('failed')
+             | map(attribute='msg') | list }}
+      when: >-
+        (wsrep_local_state.failed | default(false)) or
+        (wsrep_cluster_status.failed | default(false)) or
+        (wsrep_cluster_size.failed | default(false)) or
+        (wsrep_ready.failed | default(false))
 
 - name: Backup freshness on the designated backup node
   hosts: db_nodes
