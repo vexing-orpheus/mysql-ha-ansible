@@ -40,6 +40,18 @@ slow_query_log_file                 = {{ mysql_log_dir }}/slow.log
 long_query_time                      = 1
 
 # ── Galera / wsrep ──────────────────────────────────────────────────────
+# pxc_encrypt_cluster_traffic defaults to ON in PXC 8.0: it auto-manages
+# encryption for BOTH gcomm replication and SST, generating/using each node's
+# own self-signed cert. Those certs aren't mutually trusted across nodes (no
+# shared CA), so encrypted gcomm fails with "certificate signature failure"
+# and SST fails with "certificate verify failed" / "no peer connection" —
+# and it overrides manual per-channel settings (wsrep_provider_options
+# socket.ssl, [sst] encrypt) at connection time regardless of what's written
+# for them below, so those alone are not enough; this is the actual master
+# switch. DB nodes are assumed to share a trusted private subnet;
+# client-to-mysqld TLS is unaffected by this.
+pxc_encrypt_cluster_traffic          = OFF
+
 wsrep_on                          = ON
 wsrep_provider                      = {{ wsrep_provider_path }}
 wsrep_cluster_name                   = {{ galera_cluster_name }}
@@ -48,9 +60,12 @@ wsrep_cluster_address = gcomm://{% for host in groups['db_nodes'] %}{{ hostvars[
 wsrep_node_name                   = {{ inventory_hostname }}
 wsrep_node_address                 = {{ ansible_host }}
 
-wsrep_provider_options = "gcache.size={{ galera_gcache_size_mb }}M; gcs.fc_limit=128"
+wsrep_provider_options = "gcache.size={{ galera_gcache_size_mb }}M; gcs.fc_limit=128; socket.ssl=NO"
 wsrep_slave_threads                  = {{ ansible_processor_vcpus | default(ansible_processor_count) }}
 
 wsrep_sst_method                   = xtrabackup-v2
 
 pxc_strict_mode                      = ENFORCING
+
+[sst]
+encrypt = 0

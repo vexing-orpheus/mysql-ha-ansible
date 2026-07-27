@@ -281,15 +281,24 @@
     - ../group_vars/all/01-vars.yml
   tasks:
     - name: Count nodes fully in the Primary component and ready
+      # map('extract', hostvars, 'node_cluster_status') does a hard
+      # hostvars[item]['node_cluster_status'] lookup with no fallback — a
+      # node that dropped out of an earlier play this run (e.g. unreachable,
+      # or failed a prior task) never got its "Set per-node wsrep facts" task
+      # to run, so the key is simply absent and extract() blows up instead of
+      # letting this health check report the node as unhealthy. Extract the
+      # per-host vars dict first, then map the attribute with a default.
       ansible.builtin.set_fact:
         healthy_count: >-
           {{ groups['db_nodes']
-             | map('extract', hostvars, 'node_cluster_status')
+             | map('extract', hostvars)
+             | map(attribute='node_cluster_status', default='unknown')
              | select('equalto', 'Primary')
              | list | length }}
         synced_count: >-
           {{ groups['db_nodes']
-             | map('extract', hostvars, 'node_state')
+             | map('extract', hostvars)
+             | map(attribute='node_state', default='UNREACHABLE')
              | select('equalto', 'Synced')
              | list | length }}
 

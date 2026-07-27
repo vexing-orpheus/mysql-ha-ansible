@@ -74,12 +74,18 @@
   # The package's postinst already started mysqld once (as a temporary,
   # single-node bootstrap) to run its own first-boot initialization, then
   # deliberately shut it down again — `systemctl status mysql` reads
-  # "inactive (dead)" right after install by design. This stop is a no-op in
-  # that case and only matters as a safety net if a previous run of this
-  # role left mysqld running under a config we're about to replace.
+  # "inactive (dead)" right after install by design. This stop is mostly a
+  # safety net for a previous run of this role having left mysqld running
+  # under a config we're about to replace — but on a node that bootstrapped,
+  # that previous mysqld is running under the mysql@bootstrap.service unit,
+  # not the plain mysql unit, so both have to be stopped or the bootstrap
+  # node's mysqld silently keeps running under the stale config forever.
   ansible.builtin.systemd:
-    name: mysql
+    name: "{{ item }}"
     state: stopped
+  loop:
+    - mysql
+    - mysql@bootstrap.service
 
 - name: Check whether any other DB node already has a live cluster
   ansible.builtin.wait_for:
