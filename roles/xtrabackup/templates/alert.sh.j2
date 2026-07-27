@@ -2,10 +2,11 @@
 # Shared alert notifier — managed by Ansible (role: xtrabackup)
 # Usage: alert.sh "<message>"
 #
-# POSTs a JSON payload to a Slack/Discord-style incoming webhook. Slack
-# expects the message under "text"; Discord expects "content" — set via
-# alert_webhook_payload_key in group_vars. Teams needs a fuller adaptive-card
-# payload and isn't supported by this simple helper.
+# POSTs a JSON payload to an incoming webhook. alert_webhook_format (group_vars)
+# picks the shape: "simple" is a flat {key: message} object — Slack expects
+# the message under "text", Discord under "content", set via
+# alert_webhook_payload_key. "teams" posts a MessageCard object instead, the
+# shape Microsoft Teams / a Power Automate HTTP-trigger-to-Teams flow expects.
 set -uo pipefail
 
 MESSAGE="${1:?usage: alert.sh <message>}"
@@ -15,7 +16,16 @@ FULL_MESSAGE="[${TIMESTAMP}] ${HOST}: ${MESSAGE}"
 
 logger -t mysql-ha-alert "${FULL_MESSAGE}"
 
+{% if alert_webhook_format == 'teams' %}
+PAYLOAD=$(jq -n --arg host "${HOST}" --arg msg "${FULL_MESSAGE}" '
+    {"@type": "MessageCard", "@context": "https://schema.org/extensions",
+     "summary": ("mysql-ha-cluster alert: " + $host),
+     "themeColor": "FF0000",
+     "title": ("mysql-ha-cluster alert: " + $host),
+     "text": $msg}')
+{% else %}
 PAYLOAD=$(jq -n --arg key "{{ alert_webhook_payload_key }}" --arg msg "${FULL_MESSAGE}" '{($key): $msg}')
+{% endif %}
 
 curl -fsS -X POST -H 'Content-Type: application/json' -d "${PAYLOAD}" "{{ alert_webhook_url }}" >/dev/null \
     || logger -t mysql-ha-alert "WARNING: failed to deliver alert webhook"

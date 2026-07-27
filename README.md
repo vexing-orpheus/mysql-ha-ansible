@@ -218,11 +218,20 @@ sudo /usr/local/lib/xtrabackup-scripts/restore_verify.sh
 ```
 
 **Alerts** go to `alert_webhook_url` (prompted for interactively at run
-time — a Slack/Discord-style incoming webhook; treat it as a secret, anyone
-with the URL can post to your channel). `alert_webhook_payload_key` controls
-the JSON key used (`text` for Slack, `content` for Discord; Microsoft Teams
-needs a fuller adaptive-card payload and isn't supported by this simple
-webhook POST). Two independent alert paths:
+time — an incoming webhook URL; treat it as a secret, anyone with the URL
+can post to your channel). `alert_webhook_format` (group_vars, default
+`simple`) picks the payload shape:
+- `simple` — a flat `{key: message}` object. `alert_webhook_payload_key`
+  controls the key (`text` for Slack, `content` for Discord).
+- `teams` — a MessageCard object (`@type`/`@context`/`summary`/`title`/`text`),
+  the shape Microsoft Teams or a Power Automate "When an HTTP request is
+  received" trigger built around a Teams post normally expects. If you're
+  going through Power Automate rather than a native Teams incoming webhook,
+  double-check the flow's trigger JSON schema actually matches this shape (or
+  adjust the schema) — a schema mismatch will silently drop the fields
+  instead of erroring.
+
+Two independent alert paths, both honoring `alert_webhook_format`:
 - Each cron script (`backup.sh`, `check.sh`, `restore_verify.sh`) posts
   immediately on its own failure, via the shared
   `roles/xtrabackup/templates/alert.sh.j2` helper.

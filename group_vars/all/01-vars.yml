@@ -73,7 +73,12 @@ haproxy_stats_port:      7000
 # Global (not role defaults) because playbooks/cluster_health.yml can run
 # standalone, without the xtrabackup role ever having run in that process.
 # alert_webhook_url is prompted for interactively — see the header note above.
-alert_webhook_payload_key: text   # "text" for Slack, "content" for Discord
+# alert_webhook_format: "simple" posts a flat {key: message} object (what
+# Slack/Discord incoming webhooks expect); "teams" posts a MessageCard object
+# instead, the shape Microsoft Teams / a Power Automate "When an HTTP request
+# is received" trigger built around a Teams post normally expects.
+alert_webhook_format: simple
+alert_webhook_payload_key: text   # only used when alert_webhook_format is "simple": "text" for Slack, "content" for Discord
 
 # Global (not a role default) because playbooks/cluster_health.yml reads
 # backups directly off disk here, without the xtrabackup role's own defaults

@@ -371,12 +371,24 @@
         msg: "{{ health_problems if health_problems | length > 0 else ['All checks healthy'] }}"
 
     - name: Send a consolidated alert if any problems were found
+      # alert_webhook_format picks the payload shape — see the note in
+      # group_vars/all/01-vars.yml. "teams" builds a MessageCard object;
+      # anything else (default "simple") keeps the flat {key: message} object
+      # alert.sh.j2's cron-side alerts already use, for Slack/Discord.
       ansible.builtin.uri:
         url: "{{ alert_webhook_url }}"
         method: POST
         body_format: json
         body: >-
-          {{ {alert_webhook_payload_key: ('mysql-ha-cluster health check failed:\n' ~ (health_problems | join('\n')))} }}
+          {{
+            {"@type": "MessageCard", "@context": "https://schema.org/extensions",
+             "summary": "mysql-ha-cluster health check failed",
+             "themeColor": "FF0000",
+             "title": "mysql-ha-cluster health check failed",
+             "text": (health_problems | join('\n'))}
+            if alert_webhook_format == 'teams' else
+            {alert_webhook_payload_key: ('mysql-ha-cluster health check failed:\n' ~ (health_problems | join('\n')))}
+          }}
         status_code: [200, 204]
       when: health_problems | length > 0
       failed_when: false
