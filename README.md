@@ -21,7 +21,10 @@ mysql-ha-ansible/
 ├── group_vars/all/
 │   └── 01-vars.yml           # non-secret config (MySQL version, ports, network, tuning)
 ├── install.yml                # main build playbook — prompts for all credentials/secrets
-├── playbooks/cluster_health.yml
+├── playbooks/
+│   ├── cluster_health.yml
+│   ├── determine_backup_node.yml  # picks the active xtrabackup backup node (failover-aware)
+│   └── pitr_restore.yml           # point-in-time restore into a verification instance
 └── roles/
     ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, Percona repo
     ├── mysql_galera         # Percona XtraDB Cluster + Galera (db_nodes)
@@ -414,9 +417,30 @@ across those 3 nodes; if you need backups to survive the loss of the entire
 cluster's storage (not just one node), ship `xtrabackup_repo_path` off-box
 periodically too.
 
+**Verifying a point-in-time restore is automated** — `playbooks/pitr_restore.yml`
+prompts for a target db node and a stop datetime, then runs
+`pitr_restore.sh` (deployed to every db node, since any of them may have a
+local backup copy) there:
+```bash
+ansible-playbook playbooks/pitr_restore.yml
+```
+It picks the newest backup (full, or full+diff) at or before the given
+time, prepares/restores it into a scratch directory
+(`xtrabackup_pitr_restore_path`, default `/var/lib/xtrabackup_pitr_restore`),
+replays binlogs from that backup's `xtrabackup_binlog_info` position up to
+the exact stop time, and starts a standalone (non-Galera) `mysqld` on
+`xtrabackup_pitr_restore_port` (default 5556) against the result — all
+without touching `/var/lib/mysql` or the live cluster, so you can verify the
+restored data is right before committing to anything. It deliberately stops
+there: promoting a verified restore to become the cluster's real data is the
+separate, destructive, whole-cluster-offline procedure below (steps 1-6),
+which the playbook does not attempt to automate.
+
 Steps below restore to a specific point in time (call the target node
 `db-node-1`); for a plain restore of the latest backup instead of PITR, skip
-the `mysqlbinlog` replay step.
+the `mysqlbinlog` replay step. These are the same steps
+`pitr_restore.sh` automates up through verification (step 3) — use it
+instead of doing steps 1-3 by hand.
 
 1. **Stop MySQL on all 3 DB nodes** so the cluster doesn't try to
    re-certify writes against a node mid-restore:

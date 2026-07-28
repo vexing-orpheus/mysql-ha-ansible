@@ -32,6 +32,12 @@ xtrabackup_restore_verify_cron:
 xtrabackup_restore_verify_path: /var/lib/xtrabackup_restore_test
 xtrabackup_restore_verify_port: 5555
 
+# Scratch location/port used by playbooks/pitr_restore.yml (pitr_restore.sh)
+# — separate from the restore-verify ones above so a hand-triggered PITR
+# restore can't collide with the weekly automated restore-verify run.
+xtrabackup_pitr_restore_path: /var/lib/xtrabackup_pitr_restore
+xtrabackup_pitr_restore_port: 5556
+
 # xtrabackup_backup_freshness_hours, xtrabackup_backup_node,
 # alert_webhook_format, and alert_webhook_payload_key live in
 # group_vars/all/01-vars.yml, not here —

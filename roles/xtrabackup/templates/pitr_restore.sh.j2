@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# XtraBackup point-in-time restore — managed by Ansible (role: xtrabackup)
+# Usage: pitr_restore.sh "<stop datetime, e.g. 2026-07-28 12:00:00>"
+#
+# Picks the newest backup (full, or full+diff) at or before the given time,
+# restores it into a scratch datadir, replays binlogs up to exactly that
+# moment, and starts a standalone (non-Galera) mysqld against the result so
+# it can be verified before doing anything destructive.
+#
+# Deliberately does NOT touch the live cluster, /var/lib/mysql, or rejoin
+# Galera — promoting a verified restore to become the cluster's real data is
+# a separate, deliberate, whole-cluster-offline operation. See README.md
+# "Restoring from a backup". Normally run via playbooks/pitr_restore.yml
+# rather than by hand.
+set -uo pipefail
+
+STOP_DATETIME="${1:?usage: pitr_restore.sh \"<stop datetime>\"}"
+
+BACKUP_ROOT="{{ xtrabackup_repo_path }}"
+TARGET_DIR="{{ xtrabackup_pitr_restore_path }}"
+PORT="{{ xtrabackup_pitr_restore_port }}"
+LOG="{{ xtrabackup_log_path }}/pitr_restore.log"
+MYSQL_ROOT_PASS="{{ mysql_root_pass }}"
+
+fail() {
+    echo "PITR restore FAILED: $1" | tee -a "${LOG}" >&2
+    exit 1
+}
+
+STOP_EPOCH=$(date -d "${STOP_DATETIME}" +%s 2>/dev/null) || fail "invalid datetime: ${STOP_DATETIME}"
+
+# Backup dir names are full-YYYYMMDD_HHMMSS / diff-YYYYMMDD_HHMMSS (see
+# backup.sh) — this converts that suffix to epoch seconds for comparison.
+epoch_of() {
+    local ts="$1"
+    date -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:9:2}:${ts:11:2}:${ts:13:2}" +%s
+}
+
+{
+    echo "=== PITR restore to ${STOP_DATETIME} started $(date) ==="
+
+    # Shut down any previous PITR instance left running against this same
+    # scratch dir before wiping it.
+    if [[ -S "${TARGET_DIR}/mysqld.sock" ]]; then
+        mysqladmin --socket="${TARGET_DIR}/mysqld.sock" -uroot -p"${MYSQL_ROOT_PASS}" shutdown >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    [[ -f "${TARGET_DIR}/mysqld.pid" ]] && kill "$(cat "${TARGET_DIR}/mysqld.pid")" >/dev/null 2>&1 || true
+} >>"${LOG}" 2>&1
+
+# Newest diff at or before the target time...
+BASE_DIFF=""
+BASE_DIFF_EPOCH=0
+for d in $(find "${BACKUP_ROOT}" -maxdepth 1 -name 'diff-*' -type d | sort -r); do
+    e=$(epoch_of "${d##*/diff-}")
+    if [[ "${e}" -le "${STOP_EPOCH}" ]]; then
+        BASE_DIFF="${d}"
+        BASE_DIFF_EPOCH="${e}"
+        break
+    fi
+done
+
+# ...then the full that diff was actually taken against — i.e. whichever
+# full was newest as of the diff's own time (backup.sh always diffs against
+# "the latest full" *when the diff ran*, not necessarily today's latest
+# full). If no diff qualifies, this instead finds the newest full at or
+# before the target time directly.
+SEARCH_EPOCH="${STOP_EPOCH}"
+[[ -n "${BASE_DIFF}" ]] && SEARCH_EPOCH="${BASE_DIFF_EPOCH}"
+BASE_FULL=""
+for d in $(find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d | sort -r); do
+    e=$(epoch_of "${d##*/full-}")
+    if [[ "${e}" -le "${SEARCH_EPOCH}" ]]; then
+        BASE_FULL="${d}"
+        break
+    fi
+done
+[[ -n "${BASE_FULL}" ]] || fail "no full backup at or before ${STOP_DATETIME} found under ${BACKUP_ROOT}"
+
+{
+    echo "Base full: ${BASE_FULL}"
+    [[ -n "${BASE_DIFF}" ]] && echo "Base diff: ${BASE_DIFF}"
+} >>"${LOG}" 2>&1
+
+# Binlog coordinates to resume replay from, read from whichever backup
+# (diff if used, else full) actually ended closest to the target — straight
+# from its original directory, not the merged/prepared one, since whether
+# --prepare carries this file forward across an incremental merge varies by
+# xtrabackup version.
+BINLOG_INFO_SRC="${BASE_FULL}"
+[[ -n "${BASE_DIFF}" ]] && BINLOG_INFO_SRC="${BASE_DIFF}"
+[[ -f "${BINLOG_INFO_SRC}/xtrabackup_binlog_info" ]] || fail "${BINLOG_INFO_SRC} is missing xtrabackup_binlog_info"
+read -r BINLOG_FILE BINLOG_POS _ < "${BINLOG_INFO_SRC}/xtrabackup_binlog_info"
+echo "Binlog replay start: ${BINLOG_FILE}:${BINLOG_POS}" >>"${LOG}" 2>&1
+
+# --- Prepare ---
+rm -rf "${TARGET_DIR:?}"
+mkdir -p "${TARGET_DIR}/prepare" "${TARGET_DIR}/datadir"
+cp -a "${BASE_FULL}/." "${TARGET_DIR}/prepare/"
+
+if [[ -n "${BASE_DIFF}" ]]; then
+    xtrabackup --prepare --apply-log-only --target-dir="${TARGET_DIR}/prepare" >>"${LOG}" 2>&1 \
+        || fail "prepare (apply-log-only, full) failed — see ${LOG}"
+    xtrabackup --prepare --apply-log-only --target-dir="${TARGET_DIR}/prepare" --incremental-dir="${BASE_DIFF}" >>"${LOG}" 2>&1 \
+        || fail "prepare (apply-log-only, diff) failed — see ${LOG}"
+fi
+xtrabackup --prepare --target-dir="${TARGET_DIR}/prepare" >>"${LOG}" 2>&1 \
+    || fail "final prepare failed — see ${LOG}"
+
+# --- Copy back into the scratch datadir (never the live one) ---
+xtrabackup --copy-back --target-dir="${TARGET_DIR}/prepare" --datadir="${TARGET_DIR}/datadir" >>"${LOG}" 2>&1 \
+    || fail "copy-back failed — see ${LOG}"
+chown -R mysql:mysql "${TARGET_DIR}/datadir"
+
+# --- Start a standalone mysqld against the restored data ---
+runuser -u mysql -- mysqld --no-defaults \
+    --datadir="${TARGET_DIR}/datadir" \
+    --socket="${TARGET_DIR}/mysqld.sock" \
+    --port="${PORT}" \
+    --pid-file="${TARGET_DIR}/mysqld.pid" \
+    --wsrep-provider=none \
+    --skip-networking=0 \
+    --log-error="${TARGET_DIR}/mysqld.log" &
+disown
+
+READY=0
+for _ in $(seq 1 30); do
+    if mysqladmin --socket="${TARGET_DIR}/mysqld.sock" -uroot -p"${MYSQL_ROOT_PASS}" ping >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 1
+done
+[[ "${READY}" -eq 1 ]] || fail "temporary mysqld never became ready — see ${TARGET_DIR}/mysqld.log"
+
+# --- Replay binlogs from the noted position up to the exact stop time ---
+ALL_BINLOGS=$(find "{{ mysql_log_dir }}" -maxdepth 1 -name 'mysql-bin.[0-9]*' -type f | sort)
+BINLOG_FILES=$(echo "${ALL_BINLOGS}" | sed -n "/\\/${BINLOG_FILE}\$/,\$p")
+[[ -n "${BINLOG_FILES}" ]] || fail "binlog ${BINLOG_FILE} not found under {{ mysql_log_dir }} — it may already have been purged (see README.md PITR binlog-retention caveat)"
+
+# shellcheck disable=SC2086
+mysqlbinlog --start-position="${BINLOG_POS}" --stop-datetime="${STOP_DATETIME}" \
+    ${BINLOG_FILES} \
+    | mysql --socket="${TARGET_DIR}/mysqld.sock" -uroot -p"${MYSQL_ROOT_PASS}" >>"${LOG}" 2>&1 \
+    || fail "binlog replay failed — see ${LOG}"
+
+{
+    echo "=== PITR restore to ${STOP_DATETIME} complete $(date) ==="
+    echo "Standalone mysqld running: socket=${TARGET_DIR}/mysqld.sock port=${PORT}"
+    echo "Verify the data, then either promote it (README.md 'Restoring from a backup') or tear it down:"
+    echo "  mysqladmin --socket=${TARGET_DIR}/mysqld.sock -uroot -p'<password>' shutdown && rm -rf ${TARGET_DIR}"
+} | tee -a "${LOG}"

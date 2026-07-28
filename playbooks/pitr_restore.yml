@@ -1,0 +1,111 @@
+---
+# =============================================================================
+# pitr_restore.yml — point-in-time restore into a verification instance, run
+# from the control VM:
+#
+#   ansible-playbook playbooks/pitr_restore.yml
+#
+# Prompts for which db node to restore onto and the target datetime, then
+# runs pitr_restore.sh there: restores the newest backup (full, or full+diff)
+# at or before that time, replays binlogs up to the exact moment, and starts
+# a standalone (non-Galera) mysqld against the result so it can be verified.
+#
+# Deliberately does NOT touch the live cluster, /var/lib/mysql, or attempt to
+# rejoin Galera — promoting a verified restore to become the cluster's real
+# data (stop all 3 nodes, wipe the other two, bootstrap Galera from this one)
+# is a separate, deliberate, whole-cluster-offline operation. See README.md
+# "Restoring from a backup" for those steps once this restore looks right.
+#
+# Thanks to xtrabackup's cross-node replication (roles/xtrabackup), any
+# db_nodes member is likely to have a local backup copy, not just whichever
+# node is xtrabackup_active_backup_node right now — pick whichever one you
+# want the restored/verification instance to run on.
+# =============================================================================
+
+- name: Collect target node, restore point, and credentials
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_prompt:
+    - name: ssh_user
+      prompt: "SSH username"
+      private: false
+    - name: ssh_pass
+      prompt: "SSH / sudo password (blank to use SSH keys + passwordless sudo)"
+      private: true
+    - name: pitr_target_node
+      prompt: "Which db node to restore onto (inventory hostname, e.g. pgautox86db2)"
+      private: false
+    - name: pitr_stop_datetime
+      prompt: 'Restore to this point in time, server-local (e.g. "2026-07-28 12:00:00")'
+      private: false
+    - name: mysql_root_pass
+      prompt: "MySQL root password (used to reach the restored standalone instance)"
+      private: true
+  tasks:
+    - name: Validate the chosen target node is a real db node
+      ansible.builtin.fail:
+        msg: "{{ pitr_target_node }} is not in inventory group db_nodes ({{ groups['db_nodes'] | join(', ') }})"
+      when: pitr_target_node not in groups['db_nodes']
+
+    - name: Apply credentials and restore parameters to the target node
+      ansible.builtin.add_host:
+        name: "{{ pitr_target_node }}"
+        ansible_user: "{{ ssh_user }}"
+        ansible_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
+        ansible_become_password: "{{ ssh_pass if ssh_pass | length > 0 else omit }}"
+        mysql_root_pass: "{{ mysql_root_pass }}"
+        pitr_stop_datetime: "{{ pitr_stop_datetime }}"
+      no_log: true
+
+- name: Run the point-in-time restore
+  hosts: "{{ hostvars['localhost'].pitr_target_node }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
+  tasks:
+    - name: Confirm this node has at least one full backup to restore from
+      ansible.builtin.find:
+        paths: "{{ xtrabackup_repo_path }}"
+        patterns: "full-*"
+        file_type: directory
+      register: pitr_available_fulls
+
+    - name: Fail early if there's nothing to restore from
+      ansible.builtin.fail:
+        msg: >-
+          No full-* backup found under {{ xtrabackup_repo_path }} on
+          {{ inventory_hostname }} — nothing to restore. Check
+          xtrabackup_active_backup_node and cross-node replication status
+          (README.md "Backups & alerts") or pick a different target node.
+      when: pitr_available_fulls.matched == 0
+
+    - name: Run pitr_restore.sh (this can take a while for a large dataset)
+      ansible.builtin.command: >-
+        {{ xtrabackup_scripts_dir }}/pitr_restore.sh "{{ pitr_stop_datetime }}"
+      async: 3600
+      poll: 15
+      changed_when: true
+
+    - name: Show the restore log
+      ansible.builtin.command: "tail -60 {{ xtrabackup_log_path }}/pitr_restore.log"
+      register: pitr_log_tail
+      changed_when: false
+
+    - name: Restore log
+      ansible.builtin.debug:
+        msg: "{{ pitr_log_tail.stdout_lines }}"
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg: >-
+          Standalone restored instance is running on {{ inventory_hostname }}
+          — socket {{ xtrabackup_pitr_restore_path }}/mysqld.sock, port
+          {{ xtrabackup_pitr_restore_port }}. Verify the data (e.g. mysql
+          --socket={{ xtrabackup_pitr_restore_path }}/mysqld.sock -uroot -p),
+          then either promote it to become the cluster's real data (see
+          README.md "Restoring from a backup") or tear it down:
+          mysqladmin --socket={{ xtrabackup_pitr_restore_path }}/mysqld.sock
+          -uroot -p'<password>' shutdown && sudo rm -rf
+          {{ xtrabackup_pitr_restore_path }}

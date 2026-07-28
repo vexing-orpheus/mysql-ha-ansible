@@ -76,10 +76,14 @@
   loop_control:
     label: "{{ item }}"
 
-- name: Create the backup repo and log directories on every db node
+- name: Create the backup repo, log, and scripts directories on every db node
   # xtrabackup_repo_path must exist everywhere, not just on the active node —
   # it's the rsync destination the active node replicates into on the other
   # two, and it needs to be there in advance of the first backup run.
+  # xtrabackup_scripts_dir is also needed everywhere so pitr_restore.sh
+  # (below) can be deployed to any db node — thanks to replication, any of
+  # them may have a local backup copy to restore from, not just the active
+  # backup node.
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
@@ -89,6 +93,16 @@
   loop:
     - "{{ xtrabackup_repo_path }}"
     - "{{ xtrabackup_log_path }}"
+    - "{{ xtrabackup_scripts_dir }}"
+
+- name: Deploy the PITR restore script to every db node
+  # Not gated to the active backup node — see the directory task above.
+  ansible.builtin.template:
+    src: pitr_restore.sh.j2
+    dest: "{{ xtrabackup_scripts_dir }}/pitr_restore.sh"
+    owner: root
+    group: root
+    mode: "0700"
 
 - name: Backup setup (active backup node only)
   when: inventory_hostname == xtrabackup_effective_backup_node
@@ -101,14 +115,6 @@
     - name: Create the restore-verify scratch directory (only needed on the active node)
       ansible.builtin.file:
         path: "{{ xtrabackup_restore_verify_path }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0700"
-
-    - name: Create xtrabackup scripts directory
-      ansible.builtin.file:
-        path: "{{ xtrabackup_scripts_dir }}"
         state: directory
         owner: root
         group: root
