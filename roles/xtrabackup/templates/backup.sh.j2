@@ -20,8 +20,8 @@ LATEST_FULL=$(find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d | sort | 
 
 if [[ "${BACKUP_TYPE}" == "full" ]]; then
     TARGET="${BACKUP_ROOT}/full-${TS}"
-    xtrabackup --backup --target-dir="${TARGET}" \
-        --defaults-extra-file=/root/.my.cnf --user=root \
+    xtrabackup --defaults-extra-file=/root/.my.cnf \
+        --backup --target-dir="${TARGET}" --user=root \
         --compress --compress-threads=2 \
         >>"${LOG}" 2>&1
     RC=$?
@@ -31,8 +31,8 @@ else
         exit 1
     fi
     TARGET="${BACKUP_ROOT}/diff-${TS}"
-    xtrabackup --backup --target-dir="${TARGET}" --incremental-basedir="${LATEST_FULL}" \
-        --defaults-extra-file=/root/.my.cnf --user=root \
+    xtrabackup --defaults-extra-file=/root/.my.cnf \
+        --backup --target-dir="${TARGET}" --incremental-basedir="${LATEST_FULL}" --user=root \
         --compress --compress-threads=2 \
         >>"${LOG}" 2>&1
     RC=$?
