@@ -1,0 +1,73 @@
+---
+# =============================================================================
+# determine_backup_node.yml — picks which db_nodes host actually runs backups
+# for this playbook run: xtrabackup_backup_node (group_vars/all/01-vars.yml)
+# if it's reachable, otherwise the first other db_nodes member that is (in
+# inventory order). Every node holds identical data (Galera synchronous
+# replication), so any reachable node is a valid stand-in.
+#
+# Imported by install.yml (before the xtrabackup role play) and by
+# playbooks/cluster_health.yml (before the backup-freshness check), so both
+# agree on the same live node instead of each hardcoding xtrabackup_backup_node
+# and silently doing nothing when it's down.
+#
+# Sets xtrabackup_active_backup_node on every mysql_ha_cluster host — '' if
+# every db node is unreachable (at that point Galera itself has no quorum
+# either; this is the least of the cluster's problems, but callers should
+# still check for the empty case rather than assume a node was picked).
+# =============================================================================
+
+- name: Probe db node reachability for xtrabackup backup-node failover
+  hosts: db_nodes
+  become: false
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Ping this node
+      ansible.builtin.ping:
+      register: xtrabackup_ping_result
+      ignore_unreachable: true
+      ignore_errors: true
+
+    - name: Record reachability
+      ansible.builtin.set_fact:
+        xtrabackup_node_reachable: "{{ xtrabackup_ping_result is succeeded }}"
+
+- name: Pick the active backup node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
+  tasks:
+    - name: Build the failover order (preferred node first, then remaining db_nodes in inventory order)
+      ansible.builtin.set_fact:
+        xtrabackup_backup_node_candidates: "{{ [xtrabackup_backup_node] + (groups['db_nodes'] | difference([xtrabackup_backup_node])) }}"
+
+    - name: Default to no active backup node (all unreachable, until proven otherwise below)
+      ansible.builtin.set_fact:
+        xtrabackup_active_backup_node: ""
+
+    - name: Pick the first reachable candidate, in priority order
+      ansible.builtin.set_fact:
+        xtrabackup_active_backup_node: "{{ item }}"
+      loop: "{{ xtrabackup_backup_node_candidates }}"
+      when:
+        - xtrabackup_active_backup_node | length == 0
+        - hostvars[item].xtrabackup_node_reachable | default(false)
+
+    - name: Report the active backup node
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'xtrabackup active backup node: ' ~ xtrabackup_active_backup_node ~
+             (' (preferred node is down, failed over)' if xtrabackup_active_backup_node != xtrabackup_backup_node else '')
+             if xtrabackup_active_backup_node | length > 0
+             else 'WARNING: no db_nodes reachable — backups cannot run/be verified this cycle' }}
+
+    - name: Propagate the active backup node to every cluster host
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        xtrabackup_active_backup_node: "{{ xtrabackup_active_backup_node }}"
+      loop: "{{ groups['mysql_ha_cluster'] }}"
+      loop_control:
+        label: "{{ item }}"

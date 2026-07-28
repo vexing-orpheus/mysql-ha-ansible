@@ -20,7 +20,9 @@
 #                     quorum/group communication, so no separate DCS play is
 #                     needed.
 #   3. xtrabackup   — full/diff backups, integrity check, restore-verify cron
-#                     on a single fixed DB node (db_nodes)
+#                     on one DB node (db_nodes) — xtrabackup_backup_node if
+#                     reachable, otherwise automatic failover to another
+#                     db_nodes member (see playbooks/determine_backup_node.yml)
 #   4. haproxy_keepalived — read/write routing + VIP failover (proxy_nodes)
 #   5. cluster_health — read-only post-build gate; fails the run if wsrep
 #                     state is wrong or a service is down
@@ -145,6 +147,9 @@
       lock_timeout: 300
   roles:
     - mysql_galera
+
+- name: Determine active xtrabackup backup node (failover-aware)
+  ansible.builtin.import_playbook: playbooks/determine_backup_node.yml
 
 - name: Backups, integrity check, restore verification — DB nodes
   hosts: db_nodes

@@ -136,6 +136,9 @@
       when: standalone_run
       no_log: true
 
+- name: Determine active xtrabackup backup node (failover-aware)
+  ansible.builtin.import_playbook: determine_backup_node.yml
+
 - name: Galera cluster status
   hosts: db_nodes
   become: false
@@ -211,7 +214,7 @@
         (wsrep_cluster_size.failed | default(false)) or
         (wsrep_ready.failed | default(false))
 
-- name: Backup freshness on the designated backup node
+- name: Backup freshness on the active backup node
   hosts: db_nodes
   become: true
   gather_facts: false
@@ -219,7 +222,7 @@
     - ../group_vars/all/01-vars.yml
   tasks:
     - name: Verify the most recent backup is within the freshness threshold
-      when: inventory_hostname == xtrabackup_backup_node
+      when: inventory_hostname == (xtrabackup_active_backup_node | default(xtrabackup_backup_node, true))
       block:
         - name: Check latest backup age
           ansible.builtin.shell: |
@@ -352,11 +355,23 @@
       when: >-
         hostvars[item].node_state | default('UNREACHABLE') not in ['UNREACHABLE', 'Synced']
 
-    - name: Flag a stale or missing backup on the designated backup node
+    - name: Flag that no db node was reachable to run/verify backups at all
+      # Without this, an unreachable backup node leaves backup_stale unset on
+      # every host, and the next task's `default(false)` would silently read
+      # that as "not stale" instead of "unknown" — a fully-dead backup tier
+      # would report healthy. xtrabackup_active_backup_node is set by
+      # playbooks/determine_backup_node.yml, imported earlier in this file.
       ansible.builtin.set_fact:
-        health_problems: "{{ health_problems + [item ~ ': most recent backup is stale or missing (older than ' ~ xtrabackup_backup_freshness_hours ~ 'h)'] }}"
+        health_problems: "{{ health_problems + ['xtrabackup: no db_nodes reachable — cannot run or verify backups this cycle'] }}"
+      when: (xtrabackup_active_backup_node | default('')) | length == 0
+
+    - name: Flag a stale or missing backup on the active backup node
+      ansible.builtin.set_fact:
+        health_problems: "{{ health_problems + [item ~ ' (active backup node): most recent backup is stale or missing (older than ' ~ xtrabackup_backup_freshness_hours ~ 'h)'] }}"
       loop: "{{ groups['db_nodes'] }}"
-      when: hostvars[item].backup_stale | default(false)
+      when:
+        - (xtrabackup_active_backup_node | default('')) | length > 0
+        - hostvars[item].backup_stale | default(false)
 
     - name: Flag no HAProxy write backends up
       ansible.builtin.set_fact:

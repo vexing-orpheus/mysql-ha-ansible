@@ -4,20 +4,28 @@
 #
 # Every DB node holds an identical copy of the data (Galera synchronous
 # replication), so there's no "whichever node is currently primary" logic
-# here. Backups just run on one fixed node (xtrabackup_backup_node,
-# group_vars/all/01-vars.yml), which is neither the HAProxy-designated write
-# node nor left to chase cluster state.
+# here. Backups just run on one node — xtrabackup_backup_node
+# (group_vars/all/01-vars.yml) when it's reachable, otherwise
+# playbooks/determine_backup_node.yml (imported by install.yml before this
+# role runs) fails over to another db_nodes member and sets
+# xtrabackup_active_backup_node accordingly. The `| default(...)` fallback
+# below only matters if this role is somehow invoked without that play
+# having run first.
 # =============================================================================
 
-- name: Report that this node is not the designated backup node
+- name: Resolve the effective backup node for this run
+  ansible.builtin.set_fact:
+    xtrabackup_effective_backup_node: "{{ xtrabackup_active_backup_node | default(xtrabackup_backup_node, true) }}"
+
+- name: Report that this node is not the active backup node
   ansible.builtin.debug:
     msg: >-
-      {{ inventory_hostname }}: not xtrabackup_backup_node
-      ({{ xtrabackup_backup_node }}) — skipping backup setup on this node.
-  when: inventory_hostname != xtrabackup_backup_node
+      {{ inventory_hostname }}: not the active xtrabackup backup node
+      ({{ xtrabackup_effective_backup_node }}) — skipping backup setup on this node.
+  when: inventory_hostname != xtrabackup_effective_backup_node
 
-- name: Backup setup (designated backup node only)
-  when: inventory_hostname == xtrabackup_backup_node
+- name: Backup setup (active backup node only)
+  when: inventory_hostname == xtrabackup_effective_backup_node
   block:
     - name: Install Percona XtraBackup (idempotent — mysql_galera already installs it for SST)
       ansible.builtin.apt:
@@ -80,3 +88,21 @@
           schedule: "{{ xtrabackup_restore_verify_cron }}"
       loop_control:
         label: "{{ item.name }}"
+
+    # xtrabackup_full_backup_cron only fires weekly (default: Sunday 01:00), so
+    # a freshly-installed node would otherwise sit with an empty backup repo
+    # until the following Sunday — and every diff/check cron in between fails
+    # with "no prior full backup" / "no backups found" until then. Seed one now.
+    - name: Check for an existing full backup
+      ansible.builtin.find:
+        paths: "{{ xtrabackup_repo_path }}"
+        patterns: "full-*"
+        file_type: directory
+      register: xtrabackup_existing_full_backups
+
+    - name: Run initial full backup (fresh install — nothing for cron to diff/check against yet)
+      ansible.builtin.command: "{{ xtrabackup_scripts_dir }}/backup.sh full"
+      async: 3600
+      poll: 15
+      when: xtrabackup_existing_full_backups.matched == 0
+      changed_when: true
