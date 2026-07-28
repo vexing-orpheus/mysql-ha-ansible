@@ -24,6 +24,72 @@
       ({{ xtrabackup_effective_backup_node }}) — skipping backup setup on this node.
   when: inventory_hostname != xtrabackup_effective_backup_node
 
+# ---------------------------------------------------------------------------
+# Cross-node backup replication setup — runs on every db node, not just the
+# active one, because xtrabackup_active_backup_node can fail over to any of
+# them (playbooks/determine_backup_node.yml). Each node needs to be able to
+# push to the other two, so this is a full trust mesh rather than a one-way
+# relationship pointed at whichever node happens to be active today.
+# ---------------------------------------------------------------------------
+- name: Ensure rsync is installed (backup replication to the other db nodes)
+  ansible.builtin.apt:
+    name: rsync
+    state: present
+
+- name: Ensure /root/.ssh exists
+  ansible.builtin.file:
+    path: /root/.ssh
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Generate a root SSH keypair for backup replication, if one doesn't exist
+  ansible.builtin.command: ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519
+  args:
+    creates: /root/.ssh/id_ed25519
+
+- name: Read this node's public key
+  ansible.builtin.slurp:
+    src: /root/.ssh/id_ed25519.pub
+  register: xtrabackup_root_pubkey_raw
+
+- name: Record this node's public key as a fact (the other db nodes pick this up below)
+  ansible.builtin.set_fact:
+    xtrabackup_root_pubkey: "{{ xtrabackup_root_pubkey_raw.content | b64decode | trim }}"
+
+- name: Trust the other db nodes' SSH host keys (so rsync over ssh never prompts)
+  ansible.builtin.known_hosts:
+    name: "{{ hostvars[item].ansible_host | default(item) }}"
+    key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' ~ (hostvars[item].ansible_host | default(item))) }}"
+    path: /root/.ssh/known_hosts
+  loop: "{{ groups['db_nodes'] | difference([inventory_hostname]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Authorize every other db node's root key on this node
+  ansible.posix.authorized_key:
+    user: root
+    key: "{{ hostvars[item].xtrabackup_root_pubkey }}"
+    state: present
+  loop: "{{ groups['db_nodes'] | difference([inventory_hostname]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Create the backup repo and log directories on every db node
+  # xtrabackup_repo_path must exist everywhere, not just on the active node —
+  # it's the rsync destination the active node replicates into on the other
+  # two, and it needs to be there in advance of the first backup run.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ xtrabackup_repo_path }}"
+    - "{{ xtrabackup_log_path }}"
+
 - name: Backup setup (active backup node only)
   when: inventory_hostname == xtrabackup_effective_backup_node
   block:
@@ -32,17 +98,13 @@
         name: percona-xtrabackup-80
         state: present
 
-    - name: Create xtrabackup directories
+    - name: Create the restore-verify scratch directory (only needed on the active node)
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: "{{ xtrabackup_restore_verify_path }}"
         state: directory
         owner: root
         group: root
         mode: "0700"
-      loop:
-        - "{{ xtrabackup_repo_path }}"
-        - "{{ xtrabackup_log_path }}"
-        - "{{ xtrabackup_restore_verify_path }}"
 
     - name: Create xtrabackup scripts directory
       ansible.builtin.file:

@@ -2,9 +2,12 @@
 # XtraBackup wrapper — managed by Ansible (role: xtrabackup)
 # Usage: backup.sh <full|diff>
 #
-# Runs only on the fixed xtrabackup_backup_node (see tasks/main.yml) — every
-# Galera node holds identical data, so there's no floating-primary role to
-# chase.
+# Runs only on the active backup node (xtrabackup_active_backup_node, which
+# defaults to xtrabackup_backup_node but fails over to another db_nodes
+# member if that one's unreachable — see tasks/main.yml and
+# playbooks/determine_backup_node.yml). Replicates its output to the other
+# db nodes at the end of this script so a future failover target already
+# has backup history.
 set -uo pipefail
 
 BACKUP_TYPE="${1:?usage: backup.sh <full|diff>}"
@@ -48,3 +51,15 @@ if [[ -n "${OLDEST_KEPT_FULL}" ]]; then
     find "${BACKUP_ROOT}" -maxdepth 1 -name 'full-*' -type d ! -newer "${OLDEST_KEPT_FULL}" ! -path "${OLDEST_KEPT_FULL}" -exec rm -rf {} +
     find "${BACKUP_ROOT}" -maxdepth 1 -name 'diff-*' -type d -not -newer "${OLDEST_KEPT_FULL}" -exec rm -rf {} +
 fi
+
+# Replicate to the other db nodes — redundancy against this node's disk, and
+# so a future failover target (playbooks/determine_backup_node.yml) already
+# has backup history to diff/check against instead of starting a fresh chain.
+# --delete mirrors the retention pruning above onto the peers too. Failure
+# here alerts but doesn't fail the backup itself — the local backup already
+# succeeded, which is what check.sh cares about.
+{% for peer in groups['db_nodes'] | difference([inventory_hostname]) %}
+rsync -az --delete -e 'ssh -o BatchMode=yes' "${BACKUP_ROOT}/" "root@{{ hostvars[peer].ansible_host | default(peer) }}:${BACKUP_ROOT}/" \
+    >>"${LOG}" 2>&1 \
+    || "${ALERT}" "xtrabackup backup replication to {{ peer }} FAILED on $(hostname -s) — see ${LOG}"
+{% endfor %}

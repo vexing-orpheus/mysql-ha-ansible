@@ -25,7 +25,7 @@ mysql-ha-ansible/
 └── roles/
     ├── common               # packages, NTP, /etc/hosts, sysctl, THP, UFW, Percona repo
     ├── mysql_galera         # Percona XtraDB Cluster + Galera (db_nodes)
-    ├── xtrabackup           # backup/check/restore-verify cron (one fixed db_node)
+    ├── xtrabackup           # backup/check/restore-verify cron + cross-node replication (active db_node, auto-failover)
     └── haproxy_keepalived   # read/write routing + VIP failover (proxy_nodes)
 ```
 
@@ -134,10 +134,12 @@ This runs, in order:
    already-live cluster — just starts normally and joins via IST/SST from
    whichever peers are already up. Running this play `serial: 1` just makes
    first-time bootstrap deterministic instead of a race.
-3. **xtrabackup** on the 3 DB nodes in parallel — cron jobs for scheduled
-   backups, an integrity check, and restore verification, all gated to run
-   on a single fixed node rather than chasing a floating primary (see
-   "Backups & alerts" below).
+3. **xtrabackup** on the 3 DB nodes in parallel — first
+   `playbooks/determine_backup_node.yml` picks which node is active this run
+   (`xtrabackup_backup_node` if reachable, otherwise automatic failover to
+   another db_node), then cron jobs for scheduled backups, an integrity
+   check, and restore verification get deployed there, and backups get
+   replicated to the other two nodes (see "Backups & alerts" below).
 4. **haproxy_keepalived** on both proxy nodes in parallel.
 5. **cluster_health** (imported from `playbooks/cluster_health.yml`) —
    reports each node's wsrep state/cluster membership (asserts all 3 DB
@@ -166,17 +168,35 @@ ansible-playbook playbooks/cluster_health.yml
 Backups are handled by Percona XtraBackup (`roles/xtrabackup`), which is
 already installed on all 3 DB nodes by `mysql_galera` (it's also what
 Galera's SST uses to clone a joining node). Every Galera node holds
-identical data, so backups here just run on **one fixed node**
-(`xtrabackup_backup_node` in
-`group_vars/all/01-vars.yml`, default `groups['db_nodes'][1]` — i.e.
-db-node-2, deliberately not the HAProxy-designated write node db-node-1).
-That keeps backup I/O off the node serving writes, and avoids maintaining 3
-independent, redundant backup chains of the same data.
+identical data, so backups here just run on **one active node at a time**
+(`xtrabackup_active_backup_node`) rather than maintaining 3 independent,
+redundant backup chains of the same data.
 
-**Repo is local disk** on that one node (`xtrabackup_repo_path`, default
-`/var/lib/xtrabackup`). If `xtrabackup_backup_node` ever changes (or that
-node is rebuilt from scratch), the next scheduled full backup starts a fresh
-chain there — nothing carries over automatically.
+**Which node is active**: `playbooks/determine_backup_node.yml` (imported by
+both `install.yml` and `cluster_health.yml`, before either touches backups)
+pings every `db_nodes` member and picks `xtrabackup_backup_node`
+(`group_vars/all/01-vars.yml`, default `groups['db_nodes'][1]` — i.e.
+db-node-2, deliberately not the HAProxy-designated write node db-node-1) if
+it's reachable, otherwise the first other db_nodes member that responds.
+That keeps backup I/O off the write node under normal conditions, while
+still surviving that preferred node being down.
+
+**Failover is playbook-run-triggered, not continuous** — there's no daemon
+re-electing the active node in real time. If the active node dies mid-week,
+backups simply pause (and `cluster_health.yml` will flag it — see "Alerts"
+below) until someone re-runs `install.yml` (or re-runs just the xtrabackup
+role) with that node down; only then does `determine_backup_node.yml`
+notice and move the cron jobs/backup chain to another node.
+
+**Repo is local disk** on the active node (`xtrabackup_repo_path`, default
+`/var/lib/xtrabackup`), but it's also **replicated to the other two db
+nodes** at the end of every `backup.sh` run (`rsync -az --delete` over a
+root SSH keypair the role sets up between all 3 db nodes — see "Cross-node
+replication" below). So if `xtrabackup_active_backup_node` fails over, the
+newly-active node typically already has the prior backup chain (copied
+before the old active node went down) instead of starting fresh — the
+role's "seed an initial full backup" step only fires if no `full-*` backup
+is found locally, which a freshly-failed-over node usually won't need.
 
 **Point-in-time recovery**: binary logging is enabled (`log_bin` in
 `galera.cnf.j2`, `binlog_expire_logs_seconds` controls retention) so
@@ -191,9 +211,33 @@ chain there — nothing carries over automatically.
   daily 05:00.
 - Restore verification: weekly, Sunday 03:00.
 
-All of the above run via cron **on `xtrabackup_backup_node` only** — no
-"am I the leader" wrapper is needed, since which node runs backups is a
-fixed Ansible variable, not runtime cluster state.
+All of the above run via cron **on `xtrabackup_active_backup_node` only** —
+no "am I the leader" wrapper is needed at cron-execution time, since the
+role only ever deploys the cron jobs onto whichever node
+`determine_backup_node.yml` picked for that run.
+
+**First backup after a fresh install**: since the full-backup cron only
+fires weekly, a brand-new node would otherwise sit with an empty backup repo
+(and failing diff/check cron runs) until the following Sunday. The role
+checks for an existing `full-*` backup on the active node and, if there is
+none, runs one immediately (`backup.sh full`, `async`-wrapped so a large
+first backup doesn't hit Ansible's connection timeout) — same behavior
+applies after a failover onto a node with no prior backup history.
+
+**Cross-node replication**: the active node's `backup.sh` ends by `rsync -az --delete`-ing
+`xtrabackup_repo_path` to the other two db nodes, over a root SSH keypair
+the xtrabackup role generates and mutually authorizes between all 3 db nodes
+(a full trust mesh, not just active-node-to-others, since any node can
+become active after a failover). `--delete` mirrors the script's own
+retention pruning onto the replicas too, so they never accumulate backups
+the active node already retired.
+
+This is a deliberate expansion of trust: it gives passphrase-less root SSH
+between all 3 db nodes, matching the trust boundary Galera's own gcomm/SST
+traffic already relies on (private, mutually-trusted subnet), but is still
+worth knowing about if you're reasoning about blast radius — compromising
+one db node's root account now gets an attacker root on the other two as
+well.
 
 **Retention** (`roles/xtrabackup/defaults/main.yml`, overridable):
 - `xtrabackup_retention_full: 4` — keeps the last 4 full backup sets (each
@@ -239,7 +283,10 @@ Two independent alert paths, both honoring `alert_webhook_format`:
   checked (wsrep state/cluster membership, backup freshness, HAProxy) and
   posts one consolidated message if anything is unhealthy — this is what
   catches a problem even if the immediate cron-side alert never fired (e.g.
-  the node couldn't reach the webhook URL at the time).
+  the node couldn't reach the webhook URL at the time). It also explicitly
+  flags "no db_nodes reachable — cannot run or verify backups" if
+  `determine_backup_node.yml` couldn't find any live db node to check at
+  all, rather than silently treating an unreachable backup tier as healthy.
 
 To test the alert path end-to-end: stop `mysql` on one replica node, then run
 `ansible-playbook playbooks/cluster_health.yml` and enter a real test
@@ -357,13 +404,15 @@ only restore-related automation is
 directory to test that a backup is usable — it never touches real data (see
 "Backups & alerts" above).
 
-**Caveat:** the xtrabackup repo lives on a single fixed node
-(`xtrabackup_backup_node`, default db-node-2). If that node is unrecoverable,
-your backup chain goes with it — the other two nodes have identical *live*
-data (that's what Galera guarantees) but no independent backup history of
-their own. Treat `xtrabackup_repo_path` as something worth shipping off-box
-periodically (e.g. `rsync` to another host) if you need backups to survive
-the loss of that specific node.
+**Note:** the xtrabackup repo is replicated from the active backup node
+(`xtrabackup_active_backup_node`) to the other two db nodes at the end of
+every backup run (see "Cross-node replication" above), so `full-*`/`diff-*`
+directories are normally already present locally on all 3 db nodes, not
+just the one that took the backup — you generally don't need to manually
+copy/rsync them over before restoring. That said, it's still local-disk-only
+across those 3 nodes; if you need backups to survive the loss of the entire
+cluster's storage (not just one node), ship `xtrabackup_repo_path` off-box
+periodically too.
 
 Steps below restore to a specific point in time (call the target node
 `db-node-1`); for a plain restore of the latest backup instead of PITR, skip
@@ -376,11 +425,13 @@ the `mysqlbinlog` replay step.
    ```
 2. **On the target node**, move the current data directory aside and
    restore the latest full backup (plus its most recent diff, if any) from
-   `xtrabackup_backup_node`:
+   `xtrabackup_repo_path` — thanks to cross-node replication this is usually
+   already on local disk on every db node, not just
+   `xtrabackup_active_backup_node`; check `ls /var/lib/xtrabackup` locally
+   first before copying anything over from another node:
    ```bash
    sudo mv /var/lib/mysql /var/lib/mysql.bak
    sudo mkdir -p /var/lib/mysql
-   # Copy (or rsync) the full-*/diff-* directories over from xtrabackup_backup_node first, then:
    sudo xtrabackup --prepare --apply-log-only --target-dir=/path/to/full-YYYYmmdd_HHMMSS
    sudo xtrabackup --prepare --target-dir=/path/to/full-YYYYmmdd_HHMMSS --incremental-dir=/path/to/diff-YYYYmmdd_HHMMSS
    sudo xtrabackup --copy-back --target-dir=/path/to/full-YYYYmmdd_HHMMSS --datadir=/var/lib/mysql
