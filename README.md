@@ -523,17 +523,30 @@ the dead node promptly.
    `inventory/hosts.yml` and what every other node's `wsrep_cluster_address`
    points at. If the IP has to change, update `inventory/hosts.yml` first.
 
-3. **Run the build against just that node (plus `localhost` for
-   credentials):**
+3. **Run the build against `localhost` plus all 3 DB nodes** — not just the
+   replaced one:
    ```bash
-   ansible-playbook install.yml --limit "localhost,db-node-1"
+   ansible-playbook install.yml --limit "localhost,db_nodes"
    ```
    `mysql_galera`'s peer-liveness check (in `roles/mysql_galera/tasks/main.yml`)
    will detect that db-node-2/3 already have a live cluster and skip
    bootstrap automatically — db-node-1 just starts normally and clones the
    full dataset via SST (`xtrabackup-v2`), even though it's `db_nodes[0]`
    and would otherwise be the deterministic bootstrap node. No manual
-   membership surgery needed.
+   membership surgery needed. Both roles are idempotent on db-node-2/3, so
+   this mostly no-ops there — it's not "rebuilding" them.
+
+   **Don't scope this to just the replaced node** (e.g.
+   `--limit "localhost,db-node-1"`) even though it sounds tempting for a
+   single-node replacement: the xtrabackup role's cross-node backup
+   replication (see "Backups & alerts") sets up a mutual SSH trust mesh
+   between all 3 db nodes every run, and a fresh VM has a brand-new keypair
+   db-node-2/3 don't know about yet. If they're excluded from this run, they
+   never learn the new node's public key, db-node-1 can't push replicated
+   backups to them, and the play would in fact error out trying to read
+   db-node-2/3's own public key facts (which only get set when they're
+   actually in the play). Including all of `db_nodes` is what lets
+   db-node-2/3 pick up the new key too.
 
 4. **Verify the cluster is back to full strength:**
    ```bash
