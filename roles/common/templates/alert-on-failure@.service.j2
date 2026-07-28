@@ -1,0 +1,6 @@
+[Unit]
+Description=Alert webhook trigger for %i
+
+[Service]
+Type=oneshot
+ExecStart={{ mysql_ha_scripts_dir }}/alert.sh "%i failed (systemd OnFailure)"

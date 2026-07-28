@@ -136,6 +136,37 @@
       {% endfor %}
       {{ cluster_vip }}    mysql-cluster-vip
 
+- name: Create the shared scripts directory (alert webhook helper for systemd OnFailure hooks)
+  ansible.builtin.file:
+    path: "{{ mysql_ha_scripts_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Deploy the shared alert script
+  ansible.builtin.template:
+    src: alert.sh.j2
+    dest: "{{ mysql_ha_scripts_dir }}/alert.sh"
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Deploy the generic systemd OnFailure alert unit
+  # Instantiated per failed service via OnFailure=alert-on-failure@%n.service
+  # drop-ins added by mysql_galera (mysql.service, xinetd.service) and
+  # haproxy_keepalived (haproxy.service, keepalived.service) — see those
+  # roles. OnFailure only fires when a unit actually crashes/fails to start,
+  # never on a deliberate stop/restart (including this playbook's own), so
+  # normal maintenance doesn't spam alerts.
+  ansible.builtin.template:
+    src: alert-on-failure@.service.j2
+    dest: /etc/systemd/system/alert-on-failure@.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload systemd for alert-on-failure unit
+
 - name: Write sysctl tuning for MySQL HA
   ansible.builtin.template:
     src: 90-mysql-ha-cluster.conf.j2

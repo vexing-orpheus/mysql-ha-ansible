@@ -70,6 +70,34 @@
     group: root
     mode: "0644"
 
+- name: Create systemd drop-in directory for mysql.service
+  ansible.builtin.file:
+    path: /etc/systemd/system/mysql.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Alert on unexpected mysql.service failure
+  # OnFailure only fires when the unit actually crashes/fails to (re)start —
+  # not on a deliberate stop, including the one this role does just below on
+  # every run. See roles/common for the shared alert.sh and the generic
+  # alert-on-failure@.service template this triggers.
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mysql.service.d/alert-on-failure.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      OnFailure=alert-on-failure@%n.service
+  register: mysql_alert_on_failure_dropin
+
+- name: Reload systemd so the OnFailure drop-in is active before mysql (re)starts below
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: mysql_alert_on_failure_dropin.changed
+
 - name: Stop MySQL before applying Galera configuration
   # The package's postinst already started mysqld once (as a temporary,
   # single-node bootstrap) to run its own first-boot initialization, then
@@ -265,6 +293,30 @@
   ansible.builtin.apt:
     name: xinetd
     state: present
+
+- name: Create systemd drop-in directory for xinetd.service
+  ansible.builtin.file:
+    path: /etc/systemd/system/xinetd.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Alert on unexpected xinetd.service failure (serves the clustercheck endpoint HAProxy probes)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/xinetd.service.d/alert-on-failure.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      OnFailure=alert-on-failure@%n.service
+  register: xinetd_alert_on_failure_dropin
+
+- name: Reload systemd so the OnFailure drop-in is active before xinetd starts below
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: xinetd_alert_on_failure_dropin.changed
 
 - name: Write the clustercheck xinetd service definition
   # HAProxy (on the proxy nodes) httpchk's this port on each DB node instead

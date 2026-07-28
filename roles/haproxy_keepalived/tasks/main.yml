@@ -34,6 +34,36 @@
     vrrp_role: "{{ 'MASTER' if vrrp_is_master else 'BACKUP' }}"
     vrrp_priority: "{{ 101 if vrrp_is_master else 100 }}"
 
+- name: Create systemd drop-in directories for HAProxy/Keepalived
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [haproxy, keepalived]
+
+- name: Alert on unexpected HAProxy/Keepalived failure
+  # OnFailure only fires on an actual crash/failed (re)start — not on the
+  # deliberate stop just below, which this role does on every run. See
+  # roles/common for the shared alert.sh and the generic
+  # alert-on-failure@.service template this triggers.
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.service.d/alert-on-failure.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      OnFailure=alert-on-failure@%n.service
+  loop: [haproxy, keepalived]
+  register: haproxy_keepalived_alert_on_failure_dropin
+
+- name: Reload systemd so the OnFailure drop-ins are active before services (re)start below
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: haproxy_keepalived_alert_on_failure_dropin.changed
+
 - name: Stop services before reconfiguring
   ansible.builtin.systemd:
     name: "{{ item }}"

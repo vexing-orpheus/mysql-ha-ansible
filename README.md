@@ -278,7 +278,7 @@ can post to your channel). `alert_webhook_format` (group_vars, default
   adjust the schema) — a schema mismatch will silently drop the fields
   instead of erroring.
 
-Two independent alert paths, both honoring `alert_webhook_format`:
+Three independent alert paths, all honoring `alert_webhook_format`:
 - Each cron script (`backup.sh`, `check.sh`, `restore_verify.sh`) posts
   immediately on its own failure, via the shared
   `roles/xtrabackup/templates/alert.sh.j2` helper.
@@ -290,11 +290,36 @@ Two independent alert paths, both honoring `alert_webhook_format`:
   flags "no db_nodes reachable — cannot run or verify backups" if
   `determine_backup_node.yml` couldn't find any live db node to check at
   all, rather than silently treating an unreachable backup tier as healthy.
+- **Real-time service-crash alerts** (`roles/common`): every node gets a
+  shared `alert.sh` at `mysql_ha_scripts_dir` (default
+  `/usr/local/lib/mysql-ha-scripts`) plus a generic
+  `alert-on-failure@.service` systemd template unit. `mysql_galera` and
+  `haproxy_keepalived` each add an `OnFailure=alert-on-failure@%n.service`
+  drop-in to the services they manage — `mysql.service` and `xinetd.service`
+  (clustercheck) on db_nodes, `haproxy.service` and `keepalived.service` on
+  proxy_nodes — so a crash of any of those alerts within seconds, from
+  whichever node it happened on, without waiting for the next
+  `cluster_health.yml` poll. `OnFailure=` only fires when systemd considers
+  the unit to have actually **failed** (crashed, or failed to start) — never
+  on a deliberate `systemctl stop`/`restart`, including the ones this
+  playbook itself performs on every run, so normal deploys don't spam alerts.
+  This is a separate script/path from `roles/xtrabackup/templates/alert.sh.j2`
+  above (different deploy scope — every node vs. just the active backup
+  node — kept independent rather than shared).
 
-To test the alert path end-to-end: stop `mysql` on one replica node, then run
-`ansible-playbook playbooks/cluster_health.yml` and enter a real test
-channel's URL at the `alert_webhook_url` prompt — a failure message should
-land in the channel.
+To test the `cluster_health.yml` alert path end-to-end: stop `mysql` on one
+replica node, then run `ansible-playbook playbooks/cluster_health.yml` and
+enter a real test channel's URL at the `alert_webhook_url` prompt — a
+failure message should land in the channel.
+
+To test the real-time systemd OnFailure path specifically, actually kill the
+process rather than stopping it cleanly (a clean `systemctl stop` won't
+trigger `OnFailure=` — that's the point):
+```bash
+sudo systemctl kill --signal=SIGKILL mysql   # or haproxy / keepalived / xinetd
+```
+An alert should land within a couple of seconds. Bring it back with
+`sudo systemctl start mysql` (Galera will resync via IST/SST) once confirmed.
 
 **Enabling alerting after the fact** (e.g. you left the webhook prompt blank
 on your initial `install.yml` run): since nothing is persisted, just re-run

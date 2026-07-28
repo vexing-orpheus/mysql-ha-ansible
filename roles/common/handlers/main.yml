@@ -16,3 +16,7 @@
     daemon_reload: true
     enabled: true
     state: started
+
+- name: reload systemd for alert-on-failure unit
+  ansible.builtin.systemd:
+    daemon_reload: true
