@@ -398,6 +398,7 @@
         health_problems: "{{ health_problems + [item ~ ': no HAProxy write backends UP'] }}"
       loop: "{{ groups['proxy_nodes'] }}"
       when: >-
+        hostvars[item].haproxy_stats is defined and
         hostvars[item].haproxy_stats is succeeded and
         (hostvars[item].write_backends_up | default(0) | int) == 0
 

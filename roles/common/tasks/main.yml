@@ -138,6 +138,7 @@
     update_cache: true
     upgrade: safe
     cache_valid_time: 3600
+    lock_timeout: 120
 
 - name: Install base packages
   ansible.builtin.apt:
