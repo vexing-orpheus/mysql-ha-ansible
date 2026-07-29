@@ -290,19 +290,27 @@ Three independent alert paths, all honoring `alert_webhook_format`:
   flags "no db_nodes reachable — cannot run or verify backups" if
   `determine_backup_node.yml` couldn't find any live db node to check at
   all, rather than silently treating an unreachable backup tier as healthy.
-- **Real-time service-crash alerts** (`roles/common`): every node gets a
-  shared `alert.sh` at `mysql_ha_scripts_dir` (default
-  `/usr/local/lib/mysql-ha-scripts`) plus a generic
-  `alert-on-failure@.service` systemd template unit. `mysql_galera` and
-  `haproxy_keepalived` each add an `OnFailure=alert-on-failure@%n.service`
-  drop-in to the services they manage — `mysql.service` and `xinetd.service`
+- **Real-time service-down alerts** (`roles/common`): every node gets a
+  shared `alert.sh` and `service-down-alert.sh` at `mysql_ha_scripts_dir`
+  (default `/usr/local/lib/mysql-ha-scripts`). `mysql_galera` and
+  `haproxy_keepalived` each add an
+  `ExecStopPost={{ mysql_ha_scripts_dir }}/service-down-alert.sh %n` drop-in
+  to the services they manage — `mysql.service` and `xinetd.service`
   (clustercheck) on db_nodes, `haproxy.service` and `keepalived.service` on
-  proxy_nodes — so a crash of any of those alerts within seconds, from
-  whichever node it happened on, without waiting for the next
-  `cluster_health.yml` poll. `OnFailure=` only fires when systemd considers
-  the unit to have actually **failed** (crashed, or failed to start) — never
-  on a deliberate `systemctl stop`/`restart`, including the ones this
-  playbook itself performs on every run, so normal deploys don't spam alerts.
+  proxy_nodes — so a stop or crash of any of those alerts within seconds,
+  from whichever node it happened on, without waiting for the next
+  `cluster_health.yml` poll. `ExecStopPost=` fires on *any* stop — a real
+  crash, a failed start, or a deliberate `systemctl stop`/`restart` —
+  including the ones this playbook itself performs on every config-apply
+  run. To avoid every deploy spamming an alert for its own routine restarts,
+  `roles/common`'s very first task touches a maintenance marker
+  (`mysql_ha_silence_dir`, default `/run/mysql-ha-scripts/maintenance` —
+  tmpfs, so it self-clears on reboot) on every host at the start of the run,
+  and `cluster_health.yml`'s "Exit maintenance mode" play (near the end)
+  removes it once health checks pass; `service-down-alert.sh` skips alerting
+  while that marker is present. A run that fails/aborts before reaching that
+  final play leaves alerting silenced until the next successful run — clear
+  it manually if needed: `sudo rm -f /run/mysql-ha-scripts/maintenance`.
   This is a separate script/path from `roles/xtrabackup/templates/alert.sh.j2`
   above (different deploy scope — every node vs. just the active backup
   node — kept independent rather than shared).
@@ -312,11 +320,10 @@ replica node, then run `ansible-playbook playbooks/cluster_health.yml` and
 enter a real test channel's URL at the `alert_webhook_url` prompt — a
 failure message should land in the channel.
 
-To test the real-time systemd OnFailure path specifically, actually kill the
-process rather than stopping it cleanly (a clean `systemctl stop` won't
-trigger `OnFailure=` — that's the point):
+To test the real-time service-down path specifically, run this **outside**
+of any playbook run (so the maintenance marker isn't present):
 ```bash
-sudo systemctl kill --signal=SIGKILL mysql   # or haproxy / keepalived / xinetd
+sudo systemctl stop mysql   # or haproxy / keepalived / xinetd — a clean stop alerts too, that's the point now
 ```
 An alert should land within a couple of seconds. Bring it back with
 `sudo systemctl start mysql` (Galera will resync via IST/SST) once confirmed.

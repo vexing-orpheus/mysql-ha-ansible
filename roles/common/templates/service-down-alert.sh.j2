@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Managed by Ansible (role: common)
+# Usage: service-down-alert.sh <unit-name>
+#
+# Invoked via ExecStopPost= on each managed service's systemd unit — fires
+# whenever that service stops for ANY reason (a deliberate `systemctl
+# stop`/`restart`, a crash, or a failed start attempt), unless
+# mysql_ha_silence_dir/maintenance is present. mysql_galera and
+# haproxy_keepalived's tasks create that marker at the very start of every
+# playbook run (roles/common's first task) and playbooks/cluster_health.yml
+# removes it once the whole run's health checks pass — so this alerts on any
+# *unexpected* stop, but not on the stop/restart cycles this playbook itself
+# performs while deploying config changes.
+set -uo pipefail
+
+UNIT="${1:?usage: service-down-alert.sh <unit-name>}"
+MARKER="{{ mysql_ha_silence_dir }}/maintenance"
+
+[[ -f "${MARKER}" ]] && exit 0
+
+{{ mysql_ha_scripts_dir }}/alert.sh "${UNIT} is down (stopped or crashed)"

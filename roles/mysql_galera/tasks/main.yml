@@ -78,25 +78,25 @@
     group: root
     mode: "0755"
 
-- name: Alert on unexpected mysql.service failure
-  # OnFailure only fires when the unit actually crashes/fails to (re)start —
-  # not on a deliberate stop, including the one this role does just below on
-  # every run. See roles/common for the shared alert.sh and the generic
-  # alert-on-failure@.service template this triggers.
+- name: Alert when mysql.service stops or crashes
+  # ExecStopPost fires on ANY stop (deliberate or crash) — including the one
+  # this role does just below on every run — but service-down-alert.sh
+  # suppresses it while the maintenance marker (roles/common) is present, so
+  # only genuinely unexpected stops actually alert.
   ansible.builtin.copy:
-    dest: /etc/systemd/system/mysql.service.d/alert-on-failure.conf
+    dest: /etc/systemd/system/mysql.service.d/alert-on-stop.conf
     owner: root
     group: root
     mode: "0644"
     content: |
-      [Unit]
-      OnFailure=alert-on-failure@%n.service
-  register: mysql_alert_on_failure_dropin
+      [Service]
+      ExecStopPost={{ mysql_ha_scripts_dir }}/service-down-alert.sh %n
+  register: mysql_alert_on_stop_dropin
 
-- name: Reload systemd so the OnFailure drop-in is active before mysql (re)starts below
+- name: Reload systemd so the alert-on-stop drop-in is active before mysql (re)starts below
   ansible.builtin.systemd:
     daemon_reload: true
-  when: mysql_alert_on_failure_dropin.changed
+  when: mysql_alert_on_stop_dropin.changed
 
 - name: Stop MySQL before applying Galera configuration
   # The package's postinst already started mysqld once (as a temporary,
@@ -302,21 +302,21 @@
     group: root
     mode: "0755"
 
-- name: Alert on unexpected xinetd.service failure (serves the clustercheck endpoint HAProxy probes)
+- name: Alert when xinetd.service stops or crashes (serves the clustercheck endpoint HAProxy probes)
   ansible.builtin.copy:
-    dest: /etc/systemd/system/xinetd.service.d/alert-on-failure.conf
+    dest: /etc/systemd/system/xinetd.service.d/alert-on-stop.conf
     owner: root
     group: root
     mode: "0644"
     content: |
-      [Unit]
-      OnFailure=alert-on-failure@%n.service
-  register: xinetd_alert_on_failure_dropin
+      [Service]
+      ExecStopPost={{ mysql_ha_scripts_dir }}/service-down-alert.sh %n
+  register: xinetd_alert_on_stop_dropin
 
-- name: Reload systemd so the OnFailure drop-in is active before xinetd starts below
+- name: Reload systemd so the alert-on-stop drop-in is active before xinetd starts below
   ansible.builtin.systemd:
     daemon_reload: true
-  when: xinetd_alert_on_failure_dropin.changed
+  when: xinetd_alert_on_stop_dropin.changed
 
 - name: Write the clustercheck xinetd service definition
   # HAProxy (on the proxy nodes) httpchk's this port on each DB node instead

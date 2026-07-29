@@ -42,9 +42,3 @@ min_os_disk_gb: 50
 # Recommended-only (DB nodes): reported as a warning, never fails the play.
 db_recommended_cpu_vcpus: 8
 db_recommended_ram_mb: 16384
-
-# Where the shared alert.sh (webhook notifier backing the systemd OnFailure
-# hooks below) lives on every cluster node. Separate from
-# xtrabackup_scripts_dir, which is backup-cron-specific and only deployed to
-# the active backup node.
-mysql_ha_scripts_dir: /usr/local/lib/mysql-ha-scripts

@@ -301,6 +301,26 @@
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: {{ disk_usage.stdout }}"
 
+- name: Exit maintenance mode (re-enable service-down alerts now health checks are done)
+  # Mirrors roles/common's "Enter maintenance mode" (the first thing that
+  # runs on every host at the start of install.yml) — removing this marker
+  # is what lets mysql/haproxy/keepalived/xinetd's ExecStopPost alert hooks
+  # fire again for a genuinely unexpected stop, rather than staying silenced
+  # from this run's own deliberate config-apply restarts. Runs even when
+  # cluster_health.yml is invoked standalone (not via install.yml) — the
+  # marker just won't have existed in that case, and removing a nonexistent
+  # file is a no-op.
+  hosts: mysql_ha_cluster
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all/01-vars.yml
+  tasks:
+    - name: Remove the maintenance marker
+      ansible.builtin.file:
+        path: "{{ mysql_ha_silence_dir }}/maintenance"
+        state: absent
+
 - name: Aggregate results, alert, and gate on cluster health
   hosts: localhost
   connection: local

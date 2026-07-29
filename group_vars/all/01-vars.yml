@@ -80,6 +80,15 @@ haproxy_stats_port:      7000
 alert_webhook_format: teams
 alert_webhook_payload_key: text   # only used when alert_webhook_format is "simple": "text" for Slack, "content" for Discord
 
+# Where the shared alert.sh / service-down-alert.sh (roles/common) live on
+# every cluster node, and the /run (tmpfs — self-clears on reboot) marker
+# directory used to silence service-down alerts during an active playbook
+# run. Global (not role defaults) because playbooks/cluster_health.yml's
+# "Exit maintenance mode" play needs mysql_ha_silence_dir even when run
+# standalone, without the common role ever having run in that process.
+mysql_ha_scripts_dir: /usr/local/lib/mysql-ha-scripts
+mysql_ha_silence_dir: /run/mysql-ha-scripts
+
 # Global (not a role default) because playbooks/cluster_health.yml reads
 # backups directly off disk here, without the xtrabackup role's own defaults
 # ever being loaded when it runs standalone.

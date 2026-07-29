@@ -4,10 +4,11 @@
 #
 # Deployed to every cluster node (unlike roles/xtrabackup/templates/alert.sh.j2,
 # which is backup-cron-specific and only lives on the active backup node) —
-# this one backs the systemd OnFailure hooks on mysql.service (db_nodes) and
-# haproxy.service/keepalived.service/xinetd.service (proxy/db_nodes as
-# applicable), so a crash of any of those gets alerted from wherever it
-# happened, not just from the backup node.
+# this one is called by service-down-alert.sh.j2, which backs the systemd
+# ExecStopPost hooks on mysql.service/xinetd.service (db_nodes) and
+# haproxy.service/keepalived.service (proxy_nodes), so a stop or crash of any
+# of those gets alerted from wherever it happened, not just from the backup
+# node.
 #
 # POSTs a JSON payload to an incoming webhook. alert_webhook_format (group_vars)
 # picks the shape: "simple" is a flat {key: message} object — Slack expects

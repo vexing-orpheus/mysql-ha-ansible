@@ -4,6 +4,27 @@
 # tuning, THP, firewall, Percona repo. x86_64 only.
 # =============================================================================
 
+- name: Enter maintenance mode (silences service-down alerts for the rest of this playbook run)
+  # Marker lives on tmpfs (/run) so it self-clears on reboot rather than
+  # sticking forever if a run gets interrupted before reaching the "Exit
+  # maintenance mode" play at the end of playbooks/cluster_health.yml. See
+  # roles/common/templates/service-down-alert.sh.j2 for how this is checked.
+  ansible.builtin.file:
+    path: "{{ mysql_ha_silence_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Touch the maintenance marker
+  ansible.builtin.file:
+    path: "{{ mysql_ha_silence_dir }}/maintenance"
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+  changed_when: false
+
 - name: Fail fast on non-x86_64 hosts
   ansible.builtin.assert:
     that: ansible_architecture == "x86_64"
@@ -136,7 +157,7 @@
       {% endfor %}
       {{ cluster_vip }}    mysql-cluster-vip
 
-- name: Create the shared scripts directory (alert webhook helper for systemd OnFailure hooks)
+- name: Create the shared scripts directory
   ansible.builtin.file:
     path: "{{ mysql_ha_scripts_dir }}"
     state: directory
@@ -152,20 +173,18 @@
     group: root
     mode: "0700"
 
-- name: Deploy the generic systemd OnFailure alert unit
-  # Instantiated per failed service via OnFailure=alert-on-failure@%n.service
-  # drop-ins added by mysql_galera (mysql.service, xinetd.service) and
-  # haproxy_keepalived (haproxy.service, keepalived.service) — see those
-  # roles. OnFailure only fires when a unit actually crashes/fails to start,
-  # never on a deliberate stop/restart (including this playbook's own), so
-  # normal maintenance doesn't spam alerts.
+- name: Deploy the service-down alert script
+  # Called via ExecStopPost= drop-ins added by mysql_galera (mysql.service,
+  # xinetd.service) and haproxy_keepalived (haproxy.service,
+  # keepalived.service) — see those roles and
+  # roles/common/templates/service-down-alert.sh.j2 for the maintenance-mode
+  # suppression logic.
   ansible.builtin.template:
-    src: alert-on-failure@.service.j2
-    dest: /etc/systemd/system/alert-on-failure@.service
+    src: service-down-alert.sh.j2
+    dest: "{{ mysql_ha_scripts_dir }}/service-down-alert.sh"
     owner: root
     group: root
-    mode: "0644"
-  notify: reload systemd for alert-on-failure unit
+    mode: "0700"
 
 - name: Write sysctl tuning for MySQL HA
   ansible.builtin.template:
