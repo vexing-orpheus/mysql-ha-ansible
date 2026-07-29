@@ -126,25 +126,25 @@
   loop_control:
     label: "{{ item }}"
   when: item != inventory_hostname
-  # ignore_errors (not failed_when: false) — failed_when overwrites the
-  # registered result's `failed` key with its own evaluation, which would
-  # make every entry read failed:false regardless of whether the peer was
-  # actually reachable, and the rejectattr('failed') filter below would then
-  # count every peer as "reachable" unconditionally. ignore_errors just
-  # stops this from aborting the play while leaving the genuine pass/fail
-  # status intact for that filter to read.
-  ignore_errors: true
+  # A peer not answering on 3306 yet is the expected case on a first-time
+  # bootstrap (nobody's cluster is up yet), not a real error, so
+  # failed_when: false keeps it out of the play recap as a red/"ignoring"
+  # failure. wait_for only sets a `msg` key when it actually times out and
+  # never on success, so the reachability check below keys off `msg` instead
+  # of `failed` (which failed_when would otherwise have flattened to false
+  # for every entry regardless of outcome).
+  failed_when: false
   changed_when: false
 
 - name: Determine whether a cluster is already reachable on any peer
   # Excludes the skipped self-check entry (when: item != inventory_hostname)
-  # first — a skipped result has no "failed" key at all, so rejectattr('failed')
-  # alone would treat it as falsy/"not failed" and inflate the reachable count.
+  # first — a skipped result has neither "msg" nor "failed", so it would
+  # otherwise be miscounted as a reachable peer.
   ansible.builtin.set_fact:
     cluster_already_running: >-
       {{ peer_check.results | default([])
          | rejectattr('skipped', 'defined')
-         | rejectattr('failed')
+         | rejectattr('msg', 'defined')
          | list | length > 0 }}
 
 - name: Decide whether this node should bootstrap a brand-new cluster
