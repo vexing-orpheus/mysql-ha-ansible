@@ -7,8 +7,8 @@
 #
 # No flags needed and nothing is stored on disk: every credential (SSH login,
 # MySQL root/SST/health/app accounts, HAProxy stats, keepalived VRRP, the
-# alert webhook) is prompted for interactively by the first play below and
-# applied to every host for the rest of the run.
+# alert webhook, the off-cluster backup server) is prompted for interactively
+# by the first play below and applied to every host for the rest of the run.
 #
 # Order matters:
 #   0. Collect connection credentials — prompts once, applies to every host
@@ -92,6 +92,20 @@
     - name: alert_webhook_url
       prompt: "Alert webhook URL (blank to disable alerts)"
       private: false
+    - name: offsite_backup_host
+      prompt: "Off-cluster backup server address (blank to disable off-cluster backup replication)"
+      private: false
+    - name: offsite_backup_user
+      prompt: "Off-cluster backup server SSH username"
+      private: false
+      default: "backupuser"
+    - name: offsite_backup_pass
+      prompt: "Off-cluster backup server SSH password (used once to install a root SSH key for unattended cron transfers — never stored)"
+      private: true
+    - name: offsite_backup_dir
+      prompt: "Off-cluster backup server destination directory"
+      private: false
+      default: "/var/backups/mysql-ha-cluster"
   tasks:
     - name: Apply credentials, secrets, and network settings to every cluster host
       ansible.builtin.add_host:
@@ -114,6 +128,10 @@
         haproxy_stats_pass: "{{ haproxy_stats_pass | default('iforgottoaddapassword', true) }}"
         vrrp_auth_pass: "{{ vrrp_auth_pass | default('iforgottoaddapassword', true) }}"
         alert_webhook_url: "{{ alert_webhook_url }}"
+        offsite_backup_host: "{{ offsite_backup_host }}"
+        offsite_backup_user: "{{ offsite_backup_user }}"
+        offsite_backup_pass: "{{ offsite_backup_pass }}"
+        offsite_backup_dir: "{{ offsite_backup_dir }}"
       loop: "{{ groups['mysql_ha_cluster'] }}"
       loop_control:
         label: "{{ item }}"

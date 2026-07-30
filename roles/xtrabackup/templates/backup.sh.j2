@@ -63,3 +63,29 @@ rsync -az --delete -e 'ssh -o BatchMode=yes' "${BACKUP_ROOT}/" "root@{{ hostvars
     >>"${LOG}" 2>&1 \
     || "${ALERT}" "xtrabackup backup replication to {{ peer }} FAILED on $(hostname -s) — see ${LOG}"
 {% endfor %}
+{% if offsite_backup_host | length > 0 %}
+
+# Off-cluster replication — ships this repo to a server outside the cluster,
+# so a full-cluster storage loss (not just one node's) doesn't also take out
+# every backup copy. Deliberately NOT --delete: the off-cluster server keeps
+# its own longer retention window ({{ xtrabackup_offsite_retention_full }}
+# full sets vs. {{ xtrabackup_retention_full }} here), pruned independently
+# below rather than mirroring this node's shorter-lived local pruning.
+rsync -az -e 'ssh -o BatchMode=yes' "${BACKUP_ROOT}/" "{{ offsite_backup_user }}@{{ offsite_backup_host }}:{{ offsite_backup_dir }}/" \
+    >>"${LOG}" 2>&1 \
+    || "${ALERT}" "xtrabackup off-cluster replication to {{ offsite_backup_host }} FAILED on $(hostname -s) — see ${LOG}"
+
+# Off-cluster retention: keep the last {{ xtrabackup_offsite_retention_full }}
+# full backup sets on the remote host.
+ssh -o BatchMode=yes "{{ offsite_backup_user }}@{{ offsite_backup_host }}" bash -s -- "{{ offsite_backup_dir }}" "{{ xtrabackup_offsite_retention_full }}" >>"${LOG}" 2>&1 <<'REMOTE_PRUNE' \
+    || "${ALERT}" "xtrabackup off-cluster retention prune on {{ offsite_backup_host }} FAILED on $(hostname -s) — see ${LOG}"
+set -uo pipefail
+ROOT="$1"
+KEEP="$2"
+OLDEST_KEPT_FULL=$(find "${ROOT}" -maxdepth 1 -name 'full-*' -type d | sort | tail -n "${KEEP}" | head -1)
+if [[ -n "${OLDEST_KEPT_FULL}" ]]; then
+    find "${ROOT}" -maxdepth 1 -name 'full-*' -type d ! -newer "${OLDEST_KEPT_FULL}" ! -path "${OLDEST_KEPT_FULL}" -exec rm -rf {} +
+    find "${ROOT}" -maxdepth 1 -name 'diff-*' -type d -not -newer "${OLDEST_KEPT_FULL}" -exec rm -rf {} +
+fi
+REMOTE_PRUNE
+{% endif %}

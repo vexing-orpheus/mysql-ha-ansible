@@ -99,13 +99,16 @@ VIP (default `10.223.16.79`), the `app_network`/`ops_network` CIDRs used for
 UFW rules (default `10.223.16.0/24`), then the MySQL root password, the
 Galera SST account (used internally between DB nodes for state transfer), the
 health-check (`clustercheck`) account, the application database name/user,
-the HAProxy stats account, the VRRP (keepalived) auth password, and finally
-the alert webhook URL. Press Enter on any prompt to keep its default
-(usernames and network CIDRs have one; passwords and the webhook URL don't —
-type a value or leave blank if you don't need it, e.g. no webhook). Those
-values are then applied to all 5 hosts for the rest of the run. To pass extra
-options through (e.g. `--limit`, `-e percona_product_series=pxc57`), just
-append them: `ansible-playbook install.yml --limit db-node-1`.
+the HAProxy stats account, the VRRP (keepalived) auth password, the alert
+webhook URL, and finally the off-cluster backup server (address, SSH
+username/password, destination directory — see "Off-cluster backup
+replication" below; leave the address blank to disable it). Press Enter on
+any prompt to keep its default (usernames and network CIDRs have one;
+passwords and the webhook URL don't — type a value or leave blank if you
+don't need it, e.g. no webhook). Those values are then applied to all 5
+hosts for the rest of the run. To pass extra options through (e.g.
+`--limit`, `-e percona_product_series=pxc57`), just append them:
+`ansible-playbook install.yml --limit db-node-1`.
 
 Because nothing is persisted, you'll re-enter all of the above on every
 `install.yml` run — that's the trade-off of not using a vault file. To change
@@ -241,6 +244,48 @@ traffic already relies on (private, mutually-trusted subnet), but is still
 worth knowing about if you're reasoning about blast radius — compromising
 one db node's root account now gets an attacker root on the other two as
 well.
+
+**Off-cluster backup replication** (opt-in) closes the gap above: the
+cross-node mesh only survives losing *one* db node's storage, not all 3 at
+once (e.g. shared SAN failure, whole-site outage). Set it up by answering
+`install.yml`'s off-cluster prompts (address, SSH username/password,
+destination directory) — leave the address blank to disable it entirely,
+same convention as the alert webhook prompt.
+
+- **Auth**: the SSH password you type is used exactly once per run, to
+  install the active backup node's existing root SSH key (the same key
+  generated for the cross-node mesh above) onto the remote account via
+  `ssh-copy-id` (`roles/xtrabackup/tasks/main.yml`). The actual cron-driven
+  transfer authenticates with that key alone (`BatchMode=yes`) — the
+  password itself is never written into a script, cron job, or log.
+  Re-entering it on every `install.yml` run is a no-op once the key is
+  already installed (`ssh-copy-id` is idempotent).
+- **Transfer**: `backup.sh` rsyncs `xtrabackup_repo_path` to
+  `offsite_backup_dir` on the remote host at the end of every run, right
+  after the cross-node replication step — same mechanism, different
+  destination.
+- **Retention is independent and longer than local.** Unlike the cross-node
+  rsync (which uses `--delete` to mirror this node's own pruning onto the
+  peers), the off-cluster rsync deliberately does **not** use `--delete` —
+  the remote server keeps its own retention window
+  (`xtrabackup_offsite_retention_full`, `roles/xtrabackup/defaults/main.yml`,
+  default `12` full sets vs. the local `xtrabackup_retention_full` default
+  `4`), pruned by a small script run over SSH against the remote host at the
+  end of every backup, independently of what's already been pruned locally.
+  This is the disaster-recovery copy, not the fast-access one — override
+  `xtrabackup_offsite_retention_full` for a longer/shorter window.
+- **Prerequisites**: the off-cluster server needs its own SSH daemon
+  reachable from the active backup node (and from the Ansible control VM,
+  which needs to `ssh-keyscan` it once to seed `known_hosts`), and the given
+  SSH user needs write access to `offsite_backup_dir` (created automatically
+  if it doesn't exist). It's intentionally outside `mysql_ha_cluster` — this
+  playbook doesn't provision or firewall it.
+- **On failover**: `xtrabackup_active_backup_node` can move to a different
+  db node (`playbooks/determine_backup_node.yml`). Each db node has its own
+  SSH keypair, so a newly-active node's key won't be installed on the
+  off-cluster server yet — re-run `install.yml` (re-entering the off-cluster
+  password) after a failover to pick it up, same as any other post-failover
+  re-run.
 
 **Retention** (`roles/xtrabackup/defaults/main.yml`, overridable):
 - `xtrabackup_retention_full: 4` — keeps the last 4 full backup sets (each

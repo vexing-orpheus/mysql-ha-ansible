@@ -44,3 +44,18 @@ xtrabackup_pitr_restore_port: 5556
 # playbooks/cluster_health.yml can be run standalone (without this role ever
 # having run in that process), so anything it needs must be globally defined
 # rather than a role default.
+
+# Off-cluster backup replication — opt-in, prompted for interactively by
+# install.yml (offsite_backup_host/user/pass/dir); leave offsite_backup_host
+# blank at that prompt to disable it entirely. These defaults only matter if
+# this role is somehow invoked without that play having set them via
+# add_host — same caveat as xtrabackup_effective_backup_node above.
+offsite_backup_host: ""
+offsite_backup_user: "backupuser"
+offsite_backup_dir:  "/var/backups/mysql-ha-cluster"
+
+# Retention on the off-cluster server — deliberately longer than
+# xtrabackup_retention_full above: this is the disaster-recovery copy meant
+# to survive losing all 3 db nodes' local/replicated storage, not the
+# fast-access one, so it's worth keeping a deeper history there.
+xtrabackup_offsite_retention_full: 12

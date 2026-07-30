@@ -120,6 +120,46 @@
         group: root
         mode: "0700"
 
+    - name: Off-cluster backup replication setup (opt-in — blank offsite_backup_host disables it)
+      # Bootstraps trust to an external server outside the cluster, so a
+      # backup copy survives losing all 3 db nodes' storage (the cross-node
+      # rsync mesh above only protects against losing one node). The
+      # supplied password is used exactly once, here, to install this node's
+      # existing root SSH key (generated above for the cross-node mesh) on
+      # the remote account — the actual cron-driven transfer in backup.sh
+      # authenticates with that key alone (BatchMode=yes), so the password
+      # itself never ends up stored in a script, cron job, or log.
+      when: offsite_backup_host | length > 0
+      block:
+        - name: Ensure sshpass is installed (one-time password auth to install the offsite SSH key)
+          ansible.builtin.apt:
+            name: sshpass
+            state: present
+
+        - name: Trust the off-cluster backup server's SSH host key
+          ansible.builtin.known_hosts:
+            name: "{{ offsite_backup_host }}"
+            key: "{{ lookup('pipe', 'ssh-keyscan -t ed25519 ' ~ offsite_backup_host) }}"
+            path: /root/.ssh/known_hosts
+
+        - name: Install this node's SSH public key on the off-cluster backup server
+          ansible.builtin.command:
+            cmd: >-
+              sshpass -p {{ offsite_backup_pass | quote }}
+              ssh-copy-id -o StrictHostKeyChecking=accept-new
+              -i /root/.ssh/id_ed25519.pub
+              {{ offsite_backup_user }}@{{ offsite_backup_host }}
+          register: offsite_key_install
+          changed_when: "'Number of key(s) added' in offsite_key_install.stdout"
+          no_log: true
+
+        - name: Create the destination directory on the off-cluster backup server
+          ansible.builtin.command:
+            cmd: >-
+              ssh -o BatchMode=yes {{ offsite_backup_user }}@{{ offsite_backup_host }}
+              mkdir -p {{ offsite_backup_dir }}
+          changed_when: false
+
     - name: Deploy alert + backup/check/restore-verify scripts
       ansible.builtin.template:
         src: "{{ item }}.j2"
